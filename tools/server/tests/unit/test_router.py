@@ -148,6 +148,176 @@ def test_router_models_max_evicts_lru():
     assert _get_model_status(first) == "unloaded"
 
 
+def _write_shared_alias_preset(path: str) -> None:
+    """Two models that share the group 'flash'."""
+    with open(path, "w") as f:
+        f.write(
+            "[alias-first]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "model-group = flash\n"
+            "\n"
+            "[alias-second]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            "model-group = flash\n"
+        )
+
+
+def test_router_model_group():
+    """Several models share one group: a request for the group loads one of them."""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_shared_alias.ini")
+    _write_shared_alias_preset(preset_path)
+
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        # both models are listed, each in the shared group
+        res = server.make_request("GET", "/models")
+        assert res.status_code == 200
+        entries = {item["id"]: item for item in res.body.get("data", [])}
+        assert entries["alias-first"]["group"] == "flash"
+        assert entries["alias-second"]["group"] == "flash"
+
+        # the group is listed as a model of its own, with its members
+        assert "flash" in entries
+        assert sorted(entries["flash"]["members"]) == ["alias-first", "alias-second"]
+
+        # a request for the group loads the first member
+        res = server.make_request("POST", "/tokenize", data={"model": "flash", "content": "hello"})
+        assert res.status_code == 200
+        _wait_for_model_status("alias-first", {"loaded"}, timeout=120)
+        assert _get_model_status("alias-second") == "unloaded"
+
+        # the group keeps serving the model that is loaded
+        res = server.make_request("POST", "/tokenize", data={"model": "flash", "content": "hello"})
+        assert res.status_code == 200
+        assert _get_model_status("alias-first") == "loaded"
+        assert _get_model_status("alias-second") == "unloaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_model_group_serves_the_loaded_member():
+    """A request for a shared group goes to the member that is loaded."""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_shared_alias_loaded.ini")
+    _write_shared_alias_preset(preset_path)
+
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        # load the second member by name
+        _load_model_and_wait("alias-second", timeout=120)
+        assert _get_model_status("alias-first") == "unloaded"
+
+        # the group resolves to the member that is loaded
+        res = server.make_request("POST", "/tokenize", data={"model": "flash", "content": "hello"})
+        assert res.status_code == 200
+        assert _get_model_status("alias-second") == "loaded"
+        assert _get_model_status("alias-first") == "unloaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_alias_conflicts_with_a_model_name():
+    """An alias that is the name of another model is refused."""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_shared_alias_conflict.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[flash]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "\n"
+            "[other]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            "alias = flash\n"
+        )
+
+    server.models_preset = preset_path
+    with pytest.raises(RuntimeError):
+        server.start()
+
+    os.remove(preset_path)
+
+
+def test_router_alias_conflicts_with_another_alias():
+    """An alias that another model already declares is refused."""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_shared_alias_dup.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[first]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "alias = quick\n"
+            "\n"
+            "[second]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            "alias = quick\n"
+        )
+
+    server.models_preset = preset_path
+    with pytest.raises(RuntimeError):
+        server.start()
+
+    os.remove(preset_path)
+
+
+def test_router_model_group_serves_the_most_recent():
+    """With several members loaded, the group serves the one that was used last."""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_group_recent.ini")
+    _write_shared_alias_preset(preset_path)
+
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        # both members are loaded, the group has to pick one of them
+        _load_model_and_wait("alias-first", timeout=120)
+        _load_model_and_wait("alias-second", timeout=120)
+        assert _get_model_status("alias-first") == "loaded"
+        assert _get_model_status("alias-second") == "loaded"
+
+        res = server.make_request("POST", "/v1/completions", data={
+            "model": "flash",
+            "prompt": "hello",
+            "max_tokens": 1,
+        })
+        assert res.status_code == 200
+        assert res.body["model"] == "alias-second"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_model_group_conflicts_with_a_model_name():
+    """A group that is the name of another model is refused."""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_group_conflict.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[flash]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "\n"
+            "[other]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            "model-group = flash\n"
+        )
+
+    server.models_preset = preset_path
+    with pytest.raises(RuntimeError):
+        server.start()
+
+    os.remove(preset_path)
+
+
 # server_lru_sched tests (relying on LLAMA_SERVER_DEBUG_FAKE_TIMING)
 
 MODEL_A = "ggml-org/tinygemma3-GGUF:Q8_0"

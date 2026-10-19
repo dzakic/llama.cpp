@@ -386,6 +386,62 @@ void server_model_meta::update_caps(const common_params & base) {
     architecture = server_model_architecture_json(inp_image, inp_audio, false, output_modalities);
 }
 
+// how well a group member can serve the group: a loaded one is the best, one that
+// is coming up comes next, an unloaded one only if there is nothing else
+static int server_model_group_rank(const server_model_meta & meta) {
+    switch (meta.status) {
+        case SERVER_MODEL_STATUS_LOADED:              return 2;
+        case SERVER_MODEL_STATUS_LOADING:
+        case SERVER_MODEL_STATUS_SLEEPING:             return 1;
+        default:                                      return 0;
+    }
+}
+
+std::string server_model_resolve_name(const std::string & name, const std::vector<const server_model_meta *> & models) {
+    for (const auto * meta : models) {
+        if (meta->name == name) {
+            return name; // a canonical name resolves to itself
+        }
+    }
+
+    // the name is a group: it is shared by several models, pick the one that serves it
+    const server_model_meta * best = nullptr;
+    for (const auto * meta : models) {
+        if (meta->group != name) {
+            continue;
+        }
+        if (best == nullptr) {
+            best = meta;
+            continue;
+        }
+        const int rank = server_model_group_rank(*meta);
+        const int best_rank = server_model_group_rank(*best);
+        if (rank != best_rank) {
+            if (rank > best_rank) {
+                best = meta;
+            }
+            continue;
+        }
+        // among the members that serve the group equally well, the one that was
+        // used last serves it: the group does not switch away from a model that
+        // is already in use
+        if (meta->last_used > best->last_used) {
+            best = meta;
+        }
+    }
+    if (best != nullptr) {
+        return best->name;
+    }
+
+    // the name is an alias: it belongs to exactly one model
+    for (const auto * meta : models) {
+        if (meta->aliases.count(name)) {
+            return meta->name;
+        }
+    }
+    return "";
+}
+
 //
 // server_models
 //
@@ -431,10 +487,14 @@ void server_models::add_model(server_model_meta && meta) {
         throw std::runtime_error(string_format("model '%s' appears multiple times", meta.name.c_str()));
     }
 
-    // check model name does not conflict with existing aliases
+    // check model name does not conflict with existing aliases or groups
     for (const auto & [key, inst] : mapping) {
         if (inst.meta.aliases.count(meta.name)) {
             throw std::runtime_error(string_format("model name '%s' conflicts with alias of model '%s'",
+                meta.name.c_str(), key.c_str()));
+        }
+        if (!inst.meta.group.empty() && inst.meta.group == meta.name) {
+            throw std::runtime_error(string_format("model name '%s' conflicts with group of model '%s'",
                 meta.name.c_str(), key.c_str()));
         }
     }
@@ -450,6 +510,12 @@ void server_models::add_model(server_model_meta && meta) {
         }
     }
 
+    // parse the group from the preset's model-group option
+    std::string group;
+    if (meta.preset.get_option(COMMON_ARG_PRESET_MODEL_GROUP, group)) {
+        meta.group = string_strip(group);
+    }
+
     // parse tags from preset's --tags option (comma-separated)
     std::string tags_str;
     if (meta.preset.get_option("LLAMA_ARG_TAGS", tags_str) && !tags_str.empty()) {
@@ -461,7 +527,7 @@ void server_models::add_model(server_model_meta && meta) {
         }
     }
 
-    // validate aliases do not conflict with existing names or aliases
+    // an alias belongs to exactly one model, a name it shares with another model would be ambiguous
     for (const auto & alias : meta.aliases) {
         if (mapping.find(alias) != mapping.end()) {
             throw std::runtime_error(string_format("alias '%s' for model '%s' conflicts with existing model name",
@@ -471,6 +537,25 @@ void server_models::add_model(server_model_meta && meta) {
             if (inst.meta.aliases.count(alias)) {
                 throw std::runtime_error(string_format("alias '%s' for model '%s' conflicts with alias of model '%s'",
                     alias.c_str(), meta.name.c_str(), key.c_str()));
+            }
+            if (!inst.meta.group.empty() && inst.meta.group == alias) {
+                throw std::runtime_error(string_format("alias '%s' for model '%s' conflicts with group of model '%s'",
+                    alias.c_str(), meta.name.c_str(), key.c_str()));
+            }
+        }
+    }
+
+    // a group is shared by the models that declare it, but its name must not be
+    // a model name or an alias, a request for it would be ambiguous
+    if (!meta.group.empty()) {
+        if (mapping.find(meta.group) != mapping.end()) {
+            throw std::runtime_error(string_format("group '%s' for model '%s' conflicts with existing model name",
+                meta.group.c_str(), meta.name.c_str()));
+        }
+        for (const auto & [key, inst] : mapping) {
+            if (inst.meta.aliases.count(meta.group)) {
+                throw std::runtime_error(string_format("group '%s' for model '%s' conflicts with alias of model '%s'",
+                    meta.group.c_str(), meta.name.c_str(), key.c_str()));
             }
         }
     }
@@ -884,6 +969,7 @@ void server_models::load_models() {
                 /* preset        */ preset,
                 /* name          */ name,
                 /* aliases       */ {},
+                /* group         */ "",
                 /* tags          */ {},
                 /* port          */ 0,
                 /* status        */ SERVER_MODEL_STATUS_UNLOADED,
@@ -1006,6 +1092,26 @@ void server_models::load_models() {
                 if (!conflict) inst.meta.aliases.insert(alias);
             }
 
+            // re-parse the group, then validate it against the other models
+            inst.meta.group.clear();
+            std::string group;
+            if (inst.meta.preset.get_option(COMMON_ARG_PRESET_MODEL_GROUP, group)) {
+                group = string_strip(group);
+            }
+            if (!group.empty()) {
+                bool conflict = false;
+                for (const auto & [other_name, other_inst] : mapping) {
+                    if (other_name == name) continue;
+                    if (other_name == group || other_inst.meta.aliases.count(group)) {
+                        SRV_WRN("(reload) group '%s' for model '%s' conflicts with model '%s', skipping\n",
+                            group.c_str(), name.c_str(), other_name.c_str());
+                        conflict = true;
+                        break;
+                    }
+                }
+                if (!conflict) inst.meta.group = group;
+            }
+
             // re-parse tags
             inst.meta.tags.clear();
             std::string tags_str;
@@ -1030,6 +1136,7 @@ void server_models::load_models() {
                     /* preset        */ preset,
                     /* name          */ name,
                     /* aliases       */ {},
+                    /* group         */ "",
                     /* tags          */ {},
                     /* port          */ 0,
                     /* status        */ SERVER_MODEL_STATUS_UNLOADED,
@@ -1086,17 +1193,21 @@ void server_models::update_meta(const std::string & name, const server_model_met
     cv.notify_all(); // notify wait_until_loading_finished
 }
 
+std::string server_models::resolve_name(const std::string & name) const {
+    if (mapping.find(name) != mapping.end()) {
+        return name; // a canonical name, the common case
+    }
+    std::vector<const server_model_meta *> models;
+    models.reserve(mapping.size());
+    for (const auto & [key, inst] : mapping) {
+        models.push_back(&inst.meta);
+    }
+    return server_model_resolve_name(name, models);
+}
+
 bool server_models::has_model(const std::string & name) {
     std::lock_guard<std::mutex> lk(mutex);
-    if (mapping.find(name) != mapping.end()) {
-        return true;
-    }
-    for (const auto & [key, inst] : mapping) {
-        if (inst.meta.aliases.count(name)) {
-            return true;
-        }
-    }
-    return false;
+    return !resolve_name(name).empty();
 }
 
 std::optional<server_model_meta> server_models::get_meta(const std::string & name) {
@@ -1107,16 +1218,15 @@ std::optional<server_model_meta> server_models::get_meta(const std::string & nam
         lk.lock();
     }
 
-    auto it = mapping.find(name);
-    if (it != mapping.end()) {
-        return it->second.meta;
+    const std::string resolved = resolve_name(name);
+    if (resolved.empty()) {
+        return std::nullopt;
     }
-    for (const auto & [key, inst] : mapping) {
-        if (inst.meta.aliases.count(name)) {
-            return inst.meta;
-        }
+    auto it = mapping.find(resolved);
+    if (it == mapping.end()) {
+        return std::nullopt;
     }
-    return std::nullopt;
+    return it->second.meta;
 }
 
 std::vector<server_model_meta> server_models::get_all_meta() {
@@ -1506,7 +1616,9 @@ bool server_models::remove(const std::string & name) {
     // transient DOWNLOADING / DOWNLOADED entries as a side-effect
     std::unique_lock<std::mutex> lk(mutex);
 
-    auto it = mapping.find(name);
+    // the name may be a group or an alias, the model it resolves to is the one to remove
+    const std::string model_name = resolve_name(name);
+    auto it = mapping.find(model_name);
     if (it == mapping.end()) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
@@ -1516,33 +1628,33 @@ bool server_models::remove(const std::string & name) {
 
     if (it->second.meta.status == SERVER_MODEL_STATUS_DOWNLOADING) {
         // cancel in-flight download
-        SRV_INF("cancelling download for model name=%s\n", name.c_str());
+        SRV_INF("cancelling download for model name=%s\n", model_name.c_str());
         it->second.request_exit();
     } else if (it->second.meta.is_running()) {
         // stop running instance
-        SRV_INF("stopping model instance name=%s\n", name.c_str());
+        SRV_INF("stopping model instance name=%s\n", model_name.c_str());
         bool loading = it->second.meta.status == SERVER_MODEL_STATUS_LOADING;
         if (loading) {
             it->second.subproc->terminate();
         }
-        request_stop(name, !loading);
+        request_stop(model_name, !loading);
     }
 
     // wait until the child is gone
-    wait(lk, name, [](const server_model_meta & meta) {
+    wait(lk, model_name, [](const server_model_meta & meta) {
         return meta.status == SERVER_MODEL_STATUS_UNLOADED
             || meta.status == SERVER_MODEL_STATUS_DOWNLOADED;
     });
 
     // load_models() may have erased the entry during the wait; the files go under the
     // lock, so a download of the same tag cannot start meanwhile
-    mapping.erase(name);
-    unfinished_downloads.remove(name);
+    mapping.erase(model_name);
+    unfinished_downloads.remove(model_name);
 
     // best-effort: a cancelled download may have no cached files
-    bool ok = common_download_remove(name);
-    SRV_INF("removing model name=%s from cache (%s)\n", name.c_str(), ok ? "succeeded" : "nothing cached");
-    notify_sse("model_remove", name, {});
+    bool ok = common_download_remove(model_name);
+    SRV_INF("removing model name=%s from cache (%s)\n", model_name.c_str(), ok ? "succeeded" : "nothing cached");
+    notify_sse("model_remove", model_name, {});
     return true;
 }
 
@@ -1569,10 +1681,13 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     if (!meta.has_value()) {
         throw std::runtime_error("model name=" + name + " is not found");
     }
+    // the name may be an alias: bind the request to the model that serves it, so
+    // that the queue entry, the load and the proxy all use the same model
+    const std::string model_name = meta->name;
     bool stopping;
     {
         std::lock_guard<std::mutex> lk(mutex);
-        stopping = stopping_models.count(name) > 0;
+        stopping = stopping_models.count(model_name) > 0;
     }
     if (!stopping && meta->is_ready()) {
         return false; // ready for taking requests
@@ -1585,21 +1700,21 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     bool did_load = false;
     {
         std::unique_lock<std::mutex> lk(mutex);
-        auto it = mapping.find(name);
+        auto it = mapping.find(model_name);
         if (it != mapping.end() && it->second.meta.status == SERVER_MODEL_STATUS_UNLOADED) {
             // the queue entry protects the model from eviction until its waiters leave
-            sched->join(lk, name);
+            sched->join(lk, model_name);
             sched->tick(lk);
             queued = true;
         }
     }
 
     // while queued, this is also where the load happens: the head of the queue does it
-    SRV_INF("waiting until model name=%s is fully loaded...\n", name.c_str());
+    SRV_INF("waiting until model name=%s is fully loaded...\n", model_name.c_str());
     std::unique_lock<std::mutex> lk(mutex);
-    auto leave_queue = [this, &queued, &lk, &name]() {
+    auto leave_queue = [this, &queued, &lk, &model_name]() {
         if (queued) {
-            sched->leave(lk, name);
+            sched->leave(lk, model_name);
             queued = false;
         }
     };
@@ -1607,19 +1722,19 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
     try {
         bool saw_loading = false;
         while (true) {
-            auto it = mapping.find(name);
+            auto it = mapping.find(model_name);
             if (it == mapping.end()) {
                 break; // removed by another code path, nothing to wait for
             }
-            if (stopping_models.count(name)) {
+            if (stopping_models.count(model_name)) {
                 // a stopping instance takes no new request, the next instance serves it
                 if (!queued) {
-                    sched->join(lk, name);
+                    sched->join(lk, model_name);
                     sched->tick(lk);
                     queued = true;
                 }
                 if (should_stop && should_stop()) {
-                    throw std::runtime_error("request cancelled while waiting for model name=" + name);
+                    throw std::runtime_error("request cancelled while waiting for model name=" + model_name);
                 }
                 cv.wait_for(lk, std::chrono::milliseconds(200));
                 continue;
@@ -1638,7 +1753,7 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
                 if (did_load || saw_loading) {
                     // a spawn happened and the instance came back down
                     if (it->second.meta.is_failed()) {
-                        throw std::runtime_error("model name=" + name + " failed to load");
+                        throw std::runtime_error("model name=" + model_name + " failed to load");
                     }
                     break; // unloaded by another code path, caller reports "not running"
                 }
@@ -1649,24 +1764,24 @@ bool server_models::ensure_model_ready(const std::string & name, const std::func
 
             if (should_stop && should_stop()) {
                 // if a model was evicted for us, the free slot goes to the next waiter
-                throw std::runtime_error("request cancelled while waiting for model name=" + name);
+                throw std::runtime_error("request cancelled while waiting for model name=" + model_name);
             }
 
             // our turn: our model is at the head, and a slot really did free up
-            if (status == SERVER_MODEL_STATUS_UNLOADED && sched->try_claim(lk, name)) {
+            if (status == SERVER_MODEL_STATUS_UNLOADED && sched->try_claim(lk, model_name)) {
                 lk.unlock();
                 bool ok = true;
                 try {
-                    SRV_INF("slot available, loading queued model name=%s\n", name.c_str());
-                    load(name);
+                    SRV_INF("slot available, loading queued model name=%s\n", model_name.c_str());
+                    load(model_name);
                     did_load = true;
                 } catch (const std::exception & e) {
                     // lost a race for the slot, stay in line and retry
-                    SRV_WRN("queued load of name=%s did not go through: %s\n", name.c_str(), e.what());
+                    SRV_WRN("queued load of name=%s did not go through: %s\n", model_name.c_str(), e.what());
                     ok = false;
                 }
                 lk.lock();
-                sched->claim_done(lk, name, ok);
+                sched->claim_done(lk, model_name, ok);
                 sched->tick(lk);
                 continue;
             }
@@ -2167,6 +2282,7 @@ void server_models_routes::init_routes() {
             json model_info = json {
                 {"id",            meta.name},
                 {"aliases",       meta.aliases},
+                {"group",         meta.group},
                 {"tags",          meta.tags},
                 {"object",        "model"},    // for OAI-compat
                 {"owned_by",      "llamacpp"}, // for OAI-compat
@@ -2225,6 +2341,52 @@ void server_models_routes::init_routes() {
                 }
             }
             models_json.push_back(model_info);
+        }
+
+        // the groups, listed as models of their own: the group name is a name a
+        // request can use, so a client that discovers the models from this list
+        // can pick the group and let the router pick the member
+        {
+            std::map<std::string, std::vector<std::string>> groups;
+            for (const auto & meta : all_models) {
+                if (meta.hidden || meta.group.empty()) {
+                    continue;
+                }
+                groups[meta.group].push_back(meta.name);
+            }
+            if (!groups.empty()) {
+                std::vector<const server_model_meta *> metas;
+                metas.reserve(all_models.size());
+                for (const auto & meta : all_models) {
+                    metas.push_back(&meta);
+                }
+
+                for (const auto & [group, members] : groups) {
+                    // the group is served by one of its members, it reports the
+                    // status of that one
+                    const std::string serving = server_model_resolve_name(group, metas);
+                    std::string status_value = "unloaded";
+                    for (const auto * meta : metas) {
+                        if (meta->name == serving) {
+                            status_value = server_model_status_to_string(meta->status);
+                            break;
+                        }
+                    }
+                    models_json.push_back(json {
+                        {"id",       group},
+                        {"aliases",  json::array()},
+                        {"tags",     json::array()},
+                        {"members",  members},
+                        {"object",   "model"},
+                        {"owned_by", "llamacpp"},
+                        {"created",  t},
+                        {"status",   json {
+                            {"value", status_value},
+                            {"args",  json::array()},
+                        }},
+                    });
+                }
+            }
         }
 
         const json architecture_default = json {

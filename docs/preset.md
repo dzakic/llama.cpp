@@ -57,6 +57,27 @@ The preset will be loaded similarly to the `--models-preset` option. Therefore, 
 llama-cli -hf username/my-preset --temp 0.1
 ```
 
+### Model groups
+
+In router mode, several models of a preset can declare the same `model-group`.
+The group then names a set of models, and a request for it is served by the
+member of the group that is loaded, or by the first one if none is loaded:
+
+```ini
+[small-flash]
+hf-repo    = user/some-small-model
+model-group = flash
+
+[other-flash]
+hf-repo    = user/some-other-small-model
+model-group = flash
+```
+
+A request for `"model": "flash"` is routed to the loaded member of the group. A
+request that names a model goes to that model. The group is a router concept
+and is not passed to the model instances. See the
+[server documentation](../tools/server/README.md#model-groups) for details.
+
 ### Named presets
 
 If you want to define multiple preset configurations for one or more GGUF models, you can create a blank HF repo containing a single `preset.ini` file that references the actual model(s):

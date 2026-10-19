@@ -2131,6 +2131,7 @@ We also offer additional options that are exclusive to presets (these aren't tre
 - `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts. Only applies at startup: if the model list is reloaded later (for example after editing the preset file), a newly added model is listed but not loaded
 - `stop-timeout` (int, seconds): After requested unload, wait for this many seconds before forcing termination (default: 10)
 - `dedup-cache-models` (boolean): When the preset uses `hf-repo` pointing to a model that is already downloaded, hide the corresponding cached model entry from `GET /models` (the preset entry remains visible). Set it in the `[*]` section to apply to all presets.
+- `model-group` (string): Name of the group this model belongs to. Several models can declare the same group, and a request for the group is served by the member of the group that is loaded, or by the first one if none of them is loaded. The group name must not be the name of a model, nor an alias of one
 
 ### Routing requests
 
@@ -2191,6 +2192,45 @@ Notes:
   },
   "max":       { "n_ctx": 131072, "devices": [ /* ... */ ] },
   "effective": { "n_ctx": 131072, "devices": [ /* ... */ ] } // null unless the model is loaded
+### Model groups
+
+Several models can declare the same group with the `model-group` option. The
+group then names a set of models, and a request for it is served by one of
+them:
+
+```ini
+[small-flash]
+hf-repo    = user/some-small-model
+model-group = flash
+
+[other-flash]
+hf-repo    = user/some-other-small-model
+model-group = flash
+```
+
+A request for `"model": "flash"` is routed to the member of the group that is
+loaded, and among the loaded members to the one that was used last, so the
+group does not switch away from a model that is already in use. If none of them
+is loaded, the first one is loaded and serves the request. A request for a
+model by name (`"model": "other-flash"`) always goes to that model, and loads it
+if needed.
+
+The group is a router concept: it is not passed to the model instances. The
+name of a group must not be the name of a model, nor an alias of one, because
+a request for it would be ambiguous. An alias, on the other hand, always
+belongs to exactly one model.
+
+`GET /models` lists the group as a model of its own, with the models it holds
+in its `members` field, so that a client which discovers the models from the
+list can request the group by name:
+
+```json
+{
+  "data": [
+    { "id": "small-flash", "aliases": [], "group": "flash", "...": "..." },
+    { "id": "other-flash", "aliases": [], "group": "flash", "...": "..." },
+    { "id": "flash", "members": ["small-flash", "other-flash"], "...": "..." }
+  ]
 }
 ```
 
