@@ -76,7 +76,8 @@ struct server_model_meta {
     common_preset preset;
     std::string name;
     std::set<std::string> aliases; // additional names that resolve to this model
-    std::set<std::string> tags;    // informational tags, not used for routing
+    std::string group;              // name of the group this model belongs to, empty when it belongs to none
+    std::set<std::string> tags;     // informational tags, not used for routing
     int port = 0;
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0; // for LRU unloading
@@ -111,6 +112,14 @@ struct server_model_meta {
     void update_args(common_preset_context & ctx_presets, std::string bin_path);
     void update_caps(const common_params & base);
 };
+
+// resolve a requested name to a canonical model name
+// a canonical name resolves to itself
+// a group name resolves to the member of the group that serves it: the loaded
+// one, else the one that is coming up, else the first one
+// an alias resolves to the model that declares it
+// returns an empty string when the name is unknown
+std::string server_model_resolve_name(const std::string & name, const std::vector<const server_model_meta *> & models);
 
 // a download that never finished: the tag it was asked under, the sidecar kinds it
 // pulls and the partial files its plan writes
@@ -267,6 +276,11 @@ private:
 
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
+
+    // resolve a requested name to a canonical model name
+    // empty when the name is unknown
+    // not thread-safe, caller must hold mutex
+    std::string resolve_name(const std::string & name) const;
 
     // ask the monitor to stop a running instance; send_exit is false for a child that was already force-killed
     // not thread-safe, caller must hold mutex

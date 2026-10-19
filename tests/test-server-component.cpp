@@ -3,6 +3,7 @@
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
 #include "../tools/server/server-schema.h"
+#include "../tools/server/server-models.h"
 
 #include <algorithm>
 #include <cmath>
@@ -665,6 +666,101 @@ static void test_glob_match(testing & t) {
     });
 }
 
+// server_model_resolve_name
+//
+
+// the members of a group, as the router lists them
+struct model_group {
+    server_model_meta a;
+    server_model_meta b;
+
+    model_group() {
+        a.name = "model-a";
+        b.name = "model-b";
+        a.group = "flash";
+        b.group = "flash";
+    }
+
+    std::vector<const server_model_meta *> models() {
+        return { &a, &b };
+    }
+};
+
+static void test_model_resolve_name(testing & t) {
+    t.test("canonical name", [](testing & t) {
+        model_group g;
+        t.assert_equal("model-a", std::string("model-a"), server_model_resolve_name("model-a", g.models()));
+        t.assert_equal("model-b", std::string("model-b"), server_model_resolve_name("model-b", g.models()));
+    });
+
+    t.test("unknown name", [](testing & t) {
+        model_group g;
+        t.assert_true("empty", server_model_resolve_name("nope", g.models()).empty());
+    });
+
+    t.test("group picks the first member", [](testing & t) {
+        model_group g;
+        t.assert_equal("model-a", std::string("model-a"), server_model_resolve_name("flash", g.models()));
+    });
+
+    t.test("group picks the loaded member", [](testing & t) {
+        model_group g;
+        g.b.status = SERVER_MODEL_STATUS_LOADED;
+        t.assert_equal("model-b", std::string("model-b"), server_model_resolve_name("flash", g.models()));
+        // both loaded, the one that was used last serves the group
+        g.a.status = SERVER_MODEL_STATUS_LOADED;
+        g.a.last_used = 10;
+        g.b.last_used = 20;
+        t.assert_equal("model-b", std::string("model-b"), server_model_resolve_name("flash", g.models()));
+        g.a.last_used = 30;
+        t.assert_equal("model-a", std::string("model-a"), server_model_resolve_name("flash", g.models()));
+    });
+
+    t.test("group picks the member that is coming up", [](testing & t) {
+        model_group g;
+        g.b.status = SERVER_MODEL_STATUS_LOADING;
+        t.assert_equal("model-b", std::string("model-b"), server_model_resolve_name("flash", g.models()));
+        g.b.status = SERVER_MODEL_STATUS_SLEEPING;
+        t.assert_equal("model-b", std::string("model-b"), server_model_resolve_name("flash", g.models()));
+    });
+
+    t.test("a loaded member wins over one that is coming up", [](testing & t) {
+        model_group g;
+        g.a.status = SERVER_MODEL_STATUS_LOADED;
+        g.b.status = SERVER_MODEL_STATUS_LOADING;
+        t.assert_equal("model-a", std::string("model-a"), server_model_resolve_name("flash", g.models()));
+    });
+
+    t.test("alias resolves to its model", [](testing & t) {
+        model_group g;
+        g.a.aliases.insert("quick");
+        t.assert_equal("model-a", std::string("model-a"), server_model_resolve_name("quick", g.models()));
+    });
+
+    t.test("a group wins over an alias", [](testing & t) {
+        model_group g;
+        g.a.aliases.insert("flash");
+        t.assert_equal("model-a", std::string("model-a"), server_model_resolve_name("flash", g.models()));
+    });
+
+    t.test("a canonical name wins over a group", [](testing & t) {
+        model_group g;
+        server_model_meta c;
+        c.name = "flash";
+        std::vector<const server_model_meta *> models = { &g.a, &g.b, &c };
+        t.assert_equal("flash", std::string("flash"), server_model_resolve_name("flash", models));
+    });
+
+    t.test("a model without a group", [](testing & t) {
+        server_model_meta a;
+        a.name = "model-a";
+        std::vector<const server_model_meta *> models = { &a };
+        t.assert_equal("model-a", std::string("model-a"), server_model_resolve_name("model-a", models));
+        t.assert_true("no group", server_model_resolve_name("flash", models).empty());
+    });
+}
+
+int main(int argc, char ** argv) {
 int main(int argc, char ** argv) {
     testing t;
 
@@ -690,6 +786,7 @@ int main(int argc, char ** argv) {
     t.test("decision_depth",  test_decision_depth);
     t.test("glob_match",      test_glob_match);
     t.test("dry_sequence_breakers", test_dry_sequence_breakers);
+    t.test("model_resolve_name", test_model_resolve_name);
 
     return t.summary();
 }
