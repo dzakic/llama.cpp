@@ -77,6 +77,7 @@ struct server_model_meta {
     std::string name;
     std::set<std::string> aliases; // additional names that resolve to this model
     std::string group;              // name of the group this model belongs to, empty when it belongs to none
+    std::set<std::string> devices;  // devices the model is assigned to, empty when it is assigned to none
     std::set<std::string> tags;     // informational tags, not used for routing
     int port = 0;
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
@@ -120,6 +121,14 @@ struct server_model_meta {
 // an alias resolves to the model that declares it
 // returns an empty string when the name is unknown
 std::string server_model_resolve_name(const std::string & name, const std::vector<const server_model_meta *> & models);
+
+// the models that have to go for `name` to be loaded, the ones that hold a device
+// it needs while that device is full
+// the least recently used ones go first
+std::vector<std::string> server_model_device_conflicts(
+        const std::string & name,
+        const std::vector<const server_model_meta *> & models,
+        int max_per_device);
 
 // a download that never finished: the tag it was asked under, the sidecar kinds it
 // pulls and the partial files its plan writes
@@ -281,6 +290,14 @@ private:
     // empty when the name is unknown
     // not thread-safe, caller must hold mutex
     std::string resolve_name(const std::string & name) const;
+
+    // the running models that hold a device of `name` and are over the per device limit
+    // not thread-safe, caller must hold mutex
+    std::vector<std::string> device_conflicts(const std::string & name) const;
+
+    // wait until the devices of the model have room, the models that hold them are stopped
+    // not thread-safe, caller must hold mutex
+    void free_devices(std::unique_lock<std::mutex> & lk, const std::string & name);
 
     // ask the monitor to stop a running instance; send_exit is false for a child that was already force-killed
     // not thread-safe, caller must hold mutex

@@ -48,6 +48,45 @@ static void request_child_exit(server_subproc & proc) {
     }
 }
 
+// address for child process, this is needed because router may run on 0.0.0.0
+// ref: https://github.com/ggml-org/llama.cpp/issues/17862
+#define CHILD_ADDR "127.0.0.1"
+
+// the devices a model is assigned to, from the preset's --device option
+// the names are lowercased, the device lookup in ggml is case insensitive
+// an empty set means the model is not assigned to any device
+static std::set<std::string> parse_devices(const common_preset & preset) {
+    std::set<std::string> devices;
+
+    std::string device_str;
+    if (!preset.get_option("LLAMA_ARG_DEVICE", device_str) || device_str.empty()) {
+        return devices;
+    }
+
+    for (auto & device : string_split<std::string>(device_str, ',')) {
+        device = string_strip(device);
+        if (device.empty() || device == "none") {
+            continue; // cpu only, no device to account for
+        }
+        std::transform(device.begin(), device.end(), device.begin(),
+            [](unsigned char c) { return std::tolower(c); });
+        devices.insert(device);
+    }
+
+    return devices;
+}
+
+// true if the two models are assigned to a device in common
+static bool share_device(const server_model_meta & a, const server_model_meta & b) {
+    for (const auto & device : a.devices) {
+        if (b.devices.count(device)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+>>>>>>> c602d7ba8 (server : limit the number of models loaded on the same device)
 // single-threaded, watching all child processes at once
 struct server_monitor {
     server_monitor(server_models & models) : models(models) {
@@ -259,6 +298,192 @@ private:
     std::vector<child_t> children; // monitor thread only
     server_subproc::waiter waiter;
     std::thread th;
+};
+
+struct server_lru_sched {
+    server_lru_sched(server_models & models) : models(models) {}
+
+    bool has_capacity(std::unique_lock<std::mutex> & lk) {
+        check_lock(lk);
+        return models.base_params.models_max <= 0
+            || count_running() < (size_t) models.base_params.models_max;
+    }
+
+    // returns "" if no model can be given up
+    // `wanted` is the model the queue head asks for: a victim that holds one of its
+    // devices is preferred, so that a single eviction frees the device
+    std::string pick_victim(std::unique_lock<std::mutex> & lk, const std::string & wanted = "") {
+        check_lock(lk);
+        std::string victim;
+        int64_t victim_last_used = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            for (const auto & m : models.mapping) {
+                // a busy model is mid-request, one still coming up has no request to finish
+                if (m.second.req_count != 0 || !m.second.meta.is_ready_or_sleep()) {
+                    continue;
+                }
+                // already on its way out, or a queued request wants it
+                if (models.stopping_models.count(m.first) || find(m.first)) {
+                    continue;
+                }
+                // the first pass looks for a victim that holds a device of the wanted model
+                if (pass == 0) {
+                    auto it = models.mapping.find(wanted);
+                    if (it == models.mapping.end() || !share_device(m.second.meta, it->second.meta)) {
+                        continue;
+                    }
+                }
+                if (victim.empty() || m.second.meta.last_used < victim_last_used) {
+                    victim           = m.first;
+                    victim_last_used = m.second.meta.last_used;
+                }
+            }
+            if (!victim.empty()) {
+                return victim;
+            }
+        }
+        return "";
+    }
+
+    // true if a queued request wants this model, it is protected from eviction
+    bool has_waiters(const std::string & model_id) {
+        return find(model_id) != nullptr;
+    }
+
+    // requests wanting the same model share one entry, so they all need only one slot
+    // and all get unblocked by the single load that entry performs
+    void join(std::unique_lock<std::mutex> & lk, const std::string & model_id) {
+        check_lock(lk);
+        if (entry_t * e = find(model_id)) {
+            e->n_waiters++;
+            SRV_INF("request for name=%s joined the queue, %d waiting\n", model_id.c_str(), e->n_waiters);
+            return;
+        }
+        queue.push_back({ model_id, 1, false });
+        SRV_INF("request for name=%s queued at position %zu\n",
+                model_id.c_str(), queue.size());
+    }
+
+    void leave(std::unique_lock<std::mutex> & lk, const std::string & model_id) {
+        check_lock(lk);
+        for (auto it = queue.begin(); it != queue.end(); ++it) {
+            if (it->model_id == model_id) {
+                if (--it->n_waiters <= 0) {
+                    queue.erase(it); // last one waiting for this model went away
+                }
+                return;
+            }
+        }
+    }
+
+    bool queue_empty(std::unique_lock<std::mutex> & lk) {
+        check_lock(lk);
+        return queue.empty();
+    }
+
+    // true if it is this model's turn to load, and nobody is loading it yet
+    bool try_claim(std::unique_lock<std::mutex> & lk, const std::string & model_id) {
+        check_lock(lk);
+        if (queue.empty() || queue.front().model_id != model_id || queue.front().loading) {
+            return false;
+        }
+        if (!has_capacity(lk)) {
+            return false;
+        }
+        queue.front().loading = true;
+        return true;
+    }
+
+    // on failure the entry is back in line; on success it stays until its waiters leave,
+    // so the model coming up is never picked as a victim before they use it
+    void claim_done(std::unique_lock<std::mutex> & lk, const std::string & model_id, bool ok) {
+        check_lock(lk);
+        if (ok) {
+            return;
+        }
+        for (auto it = queue.begin(); it != queue.end(); ++it) {
+            if (it->model_id == model_id) {
+                it->loading = false;
+                return;
+            }
+        }
+    }
+
+    // evict idle models while queued requests outnumber the slots that are free or being freed
+    // caller must hold models.mutex; never blocks, so it is safe from any thread
+    void tick(std::unique_lock<std::mutex> & lk) {
+        check_lock(lk);
+        if (models.base_params.models_max <= 0 || queue.empty()) {
+            return;
+        }
+        int n_running  = 0;
+        int n_stopping = 0;
+        for (const auto & m : models.mapping) {
+            if (m.second.meta.is_running()) {
+                n_running++;
+                if (models.stopping_models.count(m.first)) {
+                    n_stopping++;
+                }
+            }
+        }
+        int n_needed  = 0;
+        int n_claimed = 0; // claimed the slot, but load() has not spawned yet
+        for (const auto & e : queue) {
+            if (!e.loading) {
+                n_needed++;
+                continue;
+            }
+            auto it = models.mapping.find(e.model_id);
+            if (it != models.mapping.end() && !it->second.meta.is_running()) {
+                n_claimed++;
+            }
+        }
+        int n_free = models.base_params.models_max - n_running + n_stopping - n_claimed;
+        // the model the queue head asks for: evicting one of its devices frees it
+        const std::string wanted = queue.empty() ? std::string() : queue.front().model_id;
+        while (n_free < n_needed) {
+            std::string victim = pick_victim(lk, wanted);
+            if (victim.empty()) {
+                return; // all remaining models are busy, wait for a request to end
+            }
+            SRV_INF("evicting idle LRU name=%s for a queued request\n", victim.c_str());
+            models.request_stop(victim);
+            n_free++;
+        }
+    }
+
+  private:
+    struct entry_t {
+        std::string model_id;
+        int  n_waiters; // requests waiting for this model
+        bool loading;   // one of the waiters is doing the load right now
+    };
+
+    entry_t * find(const std::string & model_id) {
+        for (auto & e : queue) {
+            if (e.model_id == model_id) {
+                return &e;
+            }
+        }
+        return nullptr;
+    }
+
+    void check_lock(std::unique_lock<std::mutex> & lk) {
+        GGML_ASSERT(lk.owns_lock() && lk.mutex() == &models.mutex);
+    }
+
+    size_t count_running() {
+        size_t count = 0;
+        for (const auto & m : models.mapping) {
+            if (m.second.meta.is_running()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    server_models & models;
+    std::deque<entry_t> queue;
 };
 
 // short loopback budget for the resumable stream router to child JSON calls (probe, lookup,
@@ -515,6 +740,9 @@ void server_models::add_model(server_model_meta && meta) {
     if (meta.preset.get_option(COMMON_ARG_PRESET_MODEL_GROUP, group)) {
         meta.group = string_strip(group);
     }
+
+    // parse the devices the model is assigned to
+    meta.devices = parse_devices(meta.preset);
 
     // parse tags from preset's --tags option (comma-separated)
     std::string tags_str;
@@ -970,6 +1198,7 @@ void server_models::load_models() {
                 /* name          */ name,
                 /* aliases       */ {},
                 /* group         */ "",
+                /* devices       */ {},
                 /* tags          */ {},
                 /* port          */ 0,
                 /* status        */ SERVER_MODEL_STATUS_UNLOADED,
@@ -1001,6 +1230,27 @@ void server_models::load_models() {
                 throw std::runtime_error(string_format(
                     "number of models to load on startup (%zu) exceeds models_max (%d)",
                     models_to_load.size(), base_params.models_max));
+            }
+
+            // no device may hold more of them than the limit allows
+            if (base_params.models_max_per_device > 0) {
+                std::map<std::string, int> per_device;
+                for (const auto & name : models_to_load) {
+                    auto it = mapping.find(name);
+                    if (it == mapping.end()) {
+                        continue;
+                    }
+                    for (const auto & device : it->second.meta.devices) {
+                        per_device[device]++;
+                    }
+                }
+                for (const auto & [device, count] : per_device) {
+                    if (count > base_params.models_max_per_device) {
+                        throw std::runtime_error(string_format(
+                            "number of models to load on device '%s' on startup (%d) exceeds models_max_per_device (%d)",
+                            device.c_str(), count, base_params.models_max_per_device));
+                    }
+                }
             }
 
             // to be lazy-loaded after main() setup phase is completed
@@ -1112,6 +1362,9 @@ void server_models::load_models() {
                 if (!conflict) inst.meta.group = group;
             }
 
+            // re-parse the devices
+            inst.meta.devices = parse_devices(inst.meta.preset);
+
             // re-parse tags
             inst.meta.tags.clear();
             std::string tags_str;
@@ -1137,6 +1390,7 @@ void server_models::load_models() {
                     /* name          */ name,
                     /* aliases       */ {},
                     /* group         */ "",
+                    /* devices       */ {},
                     /* tags          */ {},
                     /* port          */ 0,
                     /* status        */ SERVER_MODEL_STATUS_UNLOADED,
@@ -1245,6 +1499,121 @@ std::vector<server_model_meta> server_models::get_all_meta() {
     return result;
 }
 
+std::vector<std::string> server_model_device_conflicts(
+        const std::string & name,
+        const std::vector<const server_model_meta *> & models,
+        int max_per_device) {
+    std::vector<std::string> conflicts;
+
+    if (max_per_device <= 0) {
+        return conflicts; // no limit
+    }
+
+    const server_model_meta * self = nullptr;
+    for (const auto * meta : models) {
+        if (meta->name == name) {
+            self = meta;
+            break;
+        }
+    }
+    if (self == nullptr || self->devices.empty()) {
+        return conflicts; // the model is not assigned to any device
+    }
+
+    // the models that hold each of the devices of this model
+    std::map<std::string, std::vector<const server_model_meta *>> holders;
+    for (const auto * meta : models) {
+        if (meta == self || !meta->is_running()) {
+            continue;
+        }
+        for (const auto & device : meta->devices) {
+            if (self->devices.count(device)) {
+                holders[device].push_back(meta);
+            }
+        }
+    }
+
+    for (const auto & [device, on_device] : holders) {
+        if ((int) on_device.size() < max_per_device) {
+            continue; // the device still has room
+        }
+        // the device is full: the least recently used models on it have to go,
+        // enough of them to make room for one more
+        std::vector<const server_model_meta *> ordered = on_device;
+        std::sort(ordered.begin(), ordered.end(), [](const server_model_meta * a, const server_model_meta * b) {
+            return a->last_used < b->last_used;
+        });
+        const size_t n_remove = on_device.size() - (size_t) max_per_device + 1;
+        for (size_t i = 0; i < n_remove; i++) {
+            conflicts.push_back(ordered[i]->name);
+        }
+    }
+
+    return conflicts;
+}
+
+std::vector<std::string> server_models::device_conflicts(const std::string & name) const {
+    std::vector<const server_model_meta *> models;
+    models.reserve(mapping.size());
+    for (const auto & [key, inst] : mapping) {
+        models.push_back(&inst.meta);
+    }
+    return server_model_device_conflicts(name, models, base_params.models_max_per_device);
+}
+
+void server_models::free_devices(std::unique_lock<std::mutex> & lk, const std::string & name) {
+    while (true) {
+        const std::vector<std::string> conflicts = device_conflicts(name);
+        if (conflicts.empty()) {
+            return; // the devices have room
+        }
+        for (const auto & other : conflicts) {
+            auto it = mapping.find(other);
+            if (it == mapping.end()) {
+                continue;
+            }
+            // a busy model is mid-request, one still coming up has no request to finish
+            if (it->second.req_count != 0 || !it->second.meta.is_ready_or_sleep()) {
+                continue;
+            }
+            // already on its way out, or a queued request wants it
+            if (stopping_models.count(other) || sched->has_waiters(other)) {
+                continue;
+            }
+            SRV_INF("stopping model name=%s to free its device\n", other.c_str());
+            request_stop(other);
+        }
+        // the models that were stopped are still holding their device until they exit
+        cv.wait_for(lk, std::chrono::milliseconds(200));
+    }
+}
+
+void server_models::unload_lru() {
+    if (base_params.models_max <= 0) {
+        return; // no limit
+    }
+    // remove one of the servers if we passed the models_max (least recently used - LRU)
+    std::string lru_model_name;
+    {
+        std::unique_lock<std::mutex> lk(mutex);
+        if (sched->has_capacity(lk)) {
+            return;
+        }
+        lru_model_name = sched->pick_victim(lk);
+    }
+    if (!lru_model_name.empty()) {
+        SRV_INF("models_max limit reached, removing LRU name=%s\n", lru_model_name.c_str());
+        unload(lru_model_name);
+        // wait for unload to complete
+        {
+            std::unique_lock<std::mutex> lk(mutex);
+            cv.wait(lk, [this, &lru_model_name]() {
+                return mapping[lru_model_name].meta.status == SERVER_MODEL_STATUS_UNLOADED;
+            });
+        }
+    }
+}
+
 void server_models::load(const std::string & name) {
     load(name, load_options{});
 }
@@ -1269,6 +1638,11 @@ void server_models::load(const std::string & name, const load_options & opts) {
     // edge case: block until any in-progress reload has finished so we always load
     // against the freshest preset and a consistent mapping state
     cv.wait(lk, [this]() { return !is_reloading; });
+
+    // the devices of the model must have room, the models that hold them are stopped first
+    if (opts.mode == SERVER_CHILD_MODE_NORMAL) {
+        free_devices(lk, name);
+    }
 
     // a download over an existing entry is decided under the lock, so a load of the
     // same model cannot start in between: a paused download or an idle cached model

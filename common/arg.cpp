@@ -3716,6 +3716,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MEMORY_MARGIN"));
     add_opt(common_arg(
+        {"--models-max-per-device"}, "N",
+        string_format("for router server, maximum number of models to load on the same device (default: %d, 0 = unlimited)\n"
+                      "the devices of a model are the ones it is assigned with --device, a model without any is not counted",
+                      params.models_max_per_device),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.models_max_per_device = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_MAX_PER_DEVICE"));
+    add_opt(common_arg(
         {"--models-autoload"},
         {"--no-models-autoload"},
         string_format("for router server, whether to automatically load models (default: %s)", params.models_autoload ? "enabled" : "disabled"),

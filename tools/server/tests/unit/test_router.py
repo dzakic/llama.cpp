@@ -318,6 +318,185 @@ def test_router_model_group_conflicts_with_a_model_name():
     os.remove(preset_path)
 
 
+def _list_devices() -> list[str]:
+    """the devices the server can offload to, empty when there is none"""
+    if "LLAMA_SERVER_BIN_PATH" in os.environ:
+        binary = os.environ["LLAMA_SERVER_BIN_PATH"]
+    elif os.name == "nt":
+        binary = "../../../build/bin/Release/llama-server.exe"
+    else:
+        binary = "../../../build/bin/llama-server"
+
+    try:
+        out = subprocess.run(
+            [binary, "--list-devices"], capture_output=True, text=True, timeout=60
+        )
+    except Exception:
+        return []
+
+    devices = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line or line.endswith(":"):
+            continue
+        name = line.split(":")[0].strip()
+        if name:
+            devices.append(name)
+    return devices
+
+
+def test_router_models_max_per_device():
+    """A device holds one model at a time, the model that holds it goes first."""
+    global server
+
+    devices = _list_devices()
+    if not devices:
+        pytest.skip("no device to offload to")
+
+    device = devices[0]
+    preset_path = os.path.join(TMP_DIR, "test_per_device.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[dev-first]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            f"device = {device}\n"
+            "\n"
+            "[dev-second]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            f"device = {device}\n"
+        )
+
+    server.models_max_per_device = 1
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        _load_model_and_wait("dev-first", timeout=120)
+        assert _get_model_status("dev-first") == "loaded"
+
+        # the device is taken, the other model has to wait for it
+        res = server.make_request("POST", "/tokenize", data={"model": "dev-second", "content": "hello"})
+        assert res.status_code == 200
+        _wait_for_model_status("dev-second", {"loaded"}, timeout=120)
+        assert _get_model_status("dev-first") == "unloaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_models_max_per_device_allows_more():
+    """A device holds as many models as the limit allows."""
+    global server
+
+    devices = _list_devices()
+    if not devices:
+        pytest.skip("no device to offload to")
+
+    device = devices[0]
+    preset_path = os.path.join(TMP_DIR, "test_per_device_many.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[dev-first]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            f"device = {device}\n"
+            "\n"
+            "[dev-second]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            f"device = {device}\n"
+        )
+
+    server.models_max_per_device = 2
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        _load_model_and_wait("dev-first", timeout=120)
+        _load_model_and_wait("dev-second", timeout=120)
+        assert _get_model_status("dev-first") == "loaded"
+        assert _get_model_status("dev-second") == "loaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_models_max_per_device_other_device():
+    """A model on another device is not affected by the limit."""
+    global server
+
+    devices = _list_devices()
+    if len(devices) < 2:
+        pytest.skip("needs two devices")
+
+    preset_path = os.path.join(TMP_DIR, "test_per_device_other.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[dev-first]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            f"device = {devices[0]}\n"
+            "\n"
+            "[dev-second]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            f"device = {devices[1]}\n"
+        )
+
+    server.models_max_per_device = 1
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        _load_model_and_wait("dev-first", timeout=120)
+        _load_model_and_wait("dev-second", timeout=120)
+        assert _get_model_status("dev-first") == "loaded"
+        assert _get_model_status("dev-second") == "loaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_model_group_on_one_device():
+    """A group on a device holds one model at a time, the group serves the loaded one."""
+    global server
+
+    devices = _list_devices()
+    if not devices:
+        pytest.skip("no device to offload to")
+
+    device = devices[0]
+    preset_path = os.path.join(TMP_DIR, "test_group_device.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[flash-first]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "model-group = flash\n"
+            f"device = {device}\n"
+            "\n"
+            "[flash-second]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            "model-group = flash\n"
+            f"device = {device}\n"
+        )
+
+    server.models_max_per_device = 1
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        # a request for the group loads the first member
+        res = server.make_request("POST", "/tokenize", data={"model": "flash", "content": "hello"})
+        assert res.status_code == 200
+        _wait_for_model_status("flash-first", {"loaded"}, timeout=120)
+
+        # asking for the other one by name takes the device from the first one
+        _load_model_and_wait("flash-second", timeout=120)
+        assert _get_model_status("flash-first") == "unloaded"
+        assert _get_model_status("flash-second") == "loaded"
+
+        # the group serves the member that is loaded
+        res = server.make_request("POST", "/tokenize", data={"model": "flash", "content": "hello"})
+        assert res.status_code == 200
+        assert _get_model_status("flash-second") == "loaded"
+        assert _get_model_status("flash-first") == "unloaded"
+    finally:
+        os.remove(preset_path)
+
+
 # server_lru_sched tests (relying on LLAMA_SERVER_DEBUG_FAKE_TIMING)
 
 MODEL_A = "ggml-org/tinygemma3-GGUF:Q8_0"

@@ -2234,6 +2234,29 @@ list can request the group by name:
 }
 ```
 
+### Models per device
+
+`--models-max-per-device N` limits how many models are loaded on the same
+device. It is 0 (unlimited) by default.
+
+The devices of a model are the ones it is assigned with `--device` in its
+preset. A model that is not assigned to any device is not counted on any of
+them:
+
+```ini
+[small-flash]
+hf-repo = user/some-small-model
+device  = SYCL0
+
+[other-flash]
+hf-repo = user/some-other-small-model
+device  = SYCL0
+```
+
+With `--models-max-per-device 1`, only one of the two models above can be
+loaded at a time. Loading one of them stops the other one first, and waits for
+it to release the device.
+
 ### GET `/models`: List available models
 
 Listing all models in cache. The model metadata will also include a field to indicate the status of the model:

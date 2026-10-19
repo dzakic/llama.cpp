@@ -759,6 +759,100 @@ static void test_model_resolve_name(testing & t) {
     });
 }
 
+// server_model_device_conflicts
+//
+
+// a model assigned to the given devices
+static server_model_meta device_model(const std::string & name, const std::vector<std::string> & devices, int64_t last_used) {
+    server_model_meta meta;
+    meta.name      = name;
+    meta.status    = SERVER_MODEL_STATUS_LOADED;
+    meta.last_used = last_used;
+    for (const auto & device : devices) {
+        meta.devices.insert(device);
+    }
+    return meta;
+}
+
+static void test_model_device_conflicts(testing & t) {
+    t.test("no limit", [](testing & t) {
+        server_model_meta a = device_model("a", { "sycl0" }, 1);
+        server_model_meta b = device_model("b", { "sycl0" }, 2);
+        std::vector<const server_model_meta *> models = { &a, &b };
+        t.assert_equal("none", (size_t) 0, server_model_device_conflicts("b", models, 0).size());
+    });
+
+    t.test("same device", [](testing & t) {
+        server_model_meta a = device_model("a", { "sycl0" }, 1);
+        server_model_meta b = device_model("b", { "sycl0" }, 2);
+        std::vector<const server_model_meta *> models = { &a, &b };
+        const auto conflicts = server_model_device_conflicts("b", models, 1);
+        t.assert_equal("count", (size_t) 1, conflicts.size());
+        t.assert_equal("the other model", std::string("a"), conflicts[0]);
+    });
+
+    t.test("different devices", [](testing & t) {
+        server_model_meta a = device_model("a", { "sycl0" }, 1);
+        server_model_meta b = device_model("b", { "sycl1" }, 2);
+        std::vector<const server_model_meta *> models = { &a, &b };
+        t.assert_equal("none", (size_t) 0, server_model_device_conflicts("b", models, 1).size());
+    });
+
+    t.test("one device in common", [](testing & t) {
+        server_model_meta a = device_model("a", { "sycl0" }, 1);
+        server_model_meta b = device_model("b", { "sycl0", "sycl1" }, 2);
+        std::vector<const server_model_meta *> models = { &a, &b };
+        const auto conflicts = server_model_device_conflicts("b", models, 1);
+        t.assert_equal("count", (size_t) 1, conflicts.size());
+        t.assert_equal("the other model", std::string("a"), conflicts[0]);
+    });
+
+    t.test("a model without a device", [](testing & t) {
+        server_model_meta a = device_model("a", { "sycl0" }, 1);
+        server_model_meta b = device_model("b", {}, 2);
+        std::vector<const server_model_meta *> models = { &a, &b };
+        t.assert_equal("none", (size_t) 0, server_model_device_conflicts("b", models, 1).size());
+        t.assert_equal("none", (size_t) 0, server_model_device_conflicts("a", models, 1).size());
+    });
+
+    t.test("a model that is not running", [](testing & t) {
+        server_model_meta a = device_model("a", { "sycl0" }, 1);
+        server_model_meta b = device_model("b", { "sycl0" }, 2);
+        a.status = SERVER_MODEL_STATUS_UNLOADED;
+        std::vector<const server_model_meta *> models = { &a, &b };
+        t.assert_equal("none", (size_t) 0, server_model_device_conflicts("b", models, 1).size());
+    });
+
+    t.test("the least recently used goes first", [](testing & t) {
+        server_model_meta a = device_model("a", { "sycl0" }, 3);
+        server_model_meta b = device_model("b", { "sycl0" }, 1);
+        server_model_meta c = device_model("c", { "sycl0" }, 2);
+        std::vector<const server_model_meta *> models = { &a, &b, &c };
+        // the limit is 2, one of the three has to go
+        const auto conflicts = server_model_device_conflicts("c", models, 2);
+        t.assert_equal("count", (size_t) 1, conflicts.size());
+        t.assert_equal("the oldest", std::string("b"), conflicts[0]);
+    });
+
+    t.test("enough of them go to make room", [](testing & t) {
+        server_model_meta a = device_model("a", { "sycl0" }, 1);
+        server_model_meta b = device_model("b", { "sycl0" }, 2);
+        server_model_meta c = device_model("c", { "sycl0" }, 3);
+        std::vector<const server_model_meta *> models = { &a, &b, &c };
+        // the limit is 1, two of the three have to go
+        const auto conflicts = server_model_device_conflicts("c", models, 1);
+        t.assert_equal("count", (size_t) 2, conflicts.size());
+        t.assert_equal("the oldest", std::string("a"), conflicts[0]);
+        t.assert_equal("the next", std::string("b"), conflicts[1]);
+    });
+
+    t.test("an unknown model", [](testing & t) {
+        server_model_meta a = device_model("a", { "sycl0" }, 1);
+        std::vector<const server_model_meta *> models = { &a };
+        t.assert_equal("none", (size_t) 0, server_model_device_conflicts("b", models, 1).size());
+    });
+}
+>>>>>>> c602d7ba8 (server : limit the number of models loaded on the same device)
 int main(int argc, char ** argv) {
     testing t;
 
@@ -785,6 +879,7 @@ int main(int argc, char ** argv) {
     t.test("glob_match",      test_glob_match);
     t.test("dry_sequence_breakers", test_dry_sequence_breakers);
     t.test("model_resolve_name", test_model_resolve_name);
+    t.test("model_device_conflicts", test_model_device_conflicts);
 
     return t.summary();
 }

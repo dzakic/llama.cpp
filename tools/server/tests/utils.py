@@ -95,6 +95,7 @@ class ServerProcess:
     models_dir: str | None = None
     models_max: int | None = None
     models_memory_margin: int | None = None
+    models_max_per_device: int | None = None
     models_preset: str | None = None
     no_models_autoload: bool | None = None
     lora_files: List[str] | None = None
@@ -191,6 +192,8 @@ class ServerProcess:
             server_args.extend(["--models-max", self.models_max])
         if self.models_memory_margin is not None:
             server_args.extend(["--models-memory-margin", self.models_memory_margin])
+        if self.models_max_per_device is not None:
+            server_args.extend(["--models-max-per-device", self.models_max_per_device])
         if self.models_preset:
             server_args.extend(["--models-preset", self.models_preset])
         if self.cors_origins:
