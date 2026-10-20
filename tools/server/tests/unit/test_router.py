@@ -148,6 +148,355 @@ def test_router_models_max_evicts_lru():
     assert _get_model_status(first) == "unloaded"
 
 
+def _write_shared_alias_preset(path: str) -> None:
+    """Two models that share the group 'flash'."""
+    with open(path, "w") as f:
+        f.write(
+            "[alias-first]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "model-group = flash\n"
+            "\n"
+            "[alias-second]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            "model-group = flash\n"
+        )
+
+
+def test_router_model_group():
+    """Several models share one group: a request for the group loads one of them."""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_shared_alias.ini")
+    _write_shared_alias_preset(preset_path)
+
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        # both models are listed, each in the shared group
+        res = server.make_request("GET", "/models")
+        assert res.status_code == 200
+        entries = {item["id"]: item for item in res.body.get("data", [])}
+        assert entries["alias-first"]["group"] == "flash"
+        assert entries["alias-second"]["group"] == "flash"
+
+        # the group is listed as a model of its own, with its members
+        assert "flash" in entries
+        assert sorted(entries["flash"]["members"]) == ["alias-first", "alias-second"]
+
+        # a request for the group loads the first member
+        res = server.make_request("POST", "/tokenize", data={"model": "flash", "content": "hello"})
+        assert res.status_code == 200
+        _wait_for_model_status("alias-first", {"loaded"}, timeout=120)
+        assert _get_model_status("alias-second") == "unloaded"
+
+        # the group keeps serving the model that is loaded
+        res = server.make_request("POST", "/tokenize", data={"model": "flash", "content": "hello"})
+        assert res.status_code == 200
+        assert _get_model_status("alias-first") == "loaded"
+        assert _get_model_status("alias-second") == "unloaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_model_group_serves_the_loaded_member():
+    """A request for a shared group goes to the member that is loaded."""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_shared_alias_loaded.ini")
+    _write_shared_alias_preset(preset_path)
+
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        # load the second member by name
+        _load_model_and_wait("alias-second", timeout=120)
+        assert _get_model_status("alias-first") == "unloaded"
+
+        # the group resolves to the member that is loaded
+        res = server.make_request("POST", "/tokenize", data={"model": "flash", "content": "hello"})
+        assert res.status_code == 200
+        assert _get_model_status("alias-second") == "loaded"
+        assert _get_model_status("alias-first") == "unloaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_alias_conflicts_with_a_model_name():
+    """An alias that is the name of another model is refused."""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_shared_alias_conflict.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[flash]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "\n"
+            "[other]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            "alias = flash\n"
+        )
+
+    server.models_preset = preset_path
+    with pytest.raises(RuntimeError):
+        server.start()
+
+    os.remove(preset_path)
+
+
+def test_router_alias_conflicts_with_another_alias():
+    """An alias that another model already declares is refused."""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_shared_alias_dup.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[first]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "alias = quick\n"
+            "\n"
+            "[second]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            "alias = quick\n"
+        )
+
+    server.models_preset = preset_path
+    with pytest.raises(RuntimeError):
+        server.start()
+
+    os.remove(preset_path)
+
+
+def test_router_model_group_serves_the_most_recent():
+    """With several members loaded, the group serves the one that was used last."""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_group_recent.ini")
+    _write_shared_alias_preset(preset_path)
+
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        # both members are loaded, the group has to pick one of them
+        _load_model_and_wait("alias-first", timeout=120)
+        _load_model_and_wait("alias-second", timeout=120)
+        assert _get_model_status("alias-first") == "loaded"
+        assert _get_model_status("alias-second") == "loaded"
+
+        res = server.make_request("POST", "/v1/completions", data={
+            "model": "flash",
+            "prompt": "hello",
+            "max_tokens": 1,
+        })
+        assert res.status_code == 200
+        assert res.body["model"] == "alias-second"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_model_group_conflicts_with_a_model_name():
+    """A group that is the name of another model is refused."""
+    global server
+
+    preset_path = os.path.join(TMP_DIR, "test_group_conflict.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[flash]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "\n"
+            "[other]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            "model-group = flash\n"
+        )
+
+    server.models_preset = preset_path
+    with pytest.raises(RuntimeError):
+        server.start()
+
+    os.remove(preset_path)
+
+
+def _list_devices() -> list[str]:
+    """the devices the server can offload to, empty when there is none"""
+    if "LLAMA_SERVER_BIN_PATH" in os.environ:
+        binary = os.environ["LLAMA_SERVER_BIN_PATH"]
+    elif os.name == "nt":
+        binary = "../../../build/bin/Release/llama-server.exe"
+    else:
+        binary = "../../../build/bin/llama-server"
+
+    try:
+        out = subprocess.run(
+            [binary, "--list-devices"], capture_output=True, text=True, timeout=60
+        )
+    except Exception:
+        return []
+
+    devices = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line or line.endswith(":"):
+            continue
+        name = line.split(":")[0].strip()
+        if name:
+            devices.append(name)
+    return devices
+
+
+def test_router_models_max_per_device():
+    """A device holds one model at a time, the model that holds it goes first."""
+    global server
+
+    devices = _list_devices()
+    if not devices:
+        pytest.skip("no device to offload to")
+
+    device = devices[0]
+    preset_path = os.path.join(TMP_DIR, "test_per_device.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[dev-first]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            f"device = {device}\n"
+            "\n"
+            "[dev-second]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            f"device = {device}\n"
+        )
+
+    server.models_max_per_device = 1
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        _load_model_and_wait("dev-first", timeout=120)
+        assert _get_model_status("dev-first") == "loaded"
+
+        # the device is taken, the other model has to wait for it
+        res = server.make_request("POST", "/tokenize", data={"model": "dev-second", "content": "hello"})
+        assert res.status_code == 200
+        _wait_for_model_status("dev-second", {"loaded"}, timeout=120)
+        assert _get_model_status("dev-first") == "unloaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_models_max_per_device_allows_more():
+    """A device holds as many models as the limit allows."""
+    global server
+
+    devices = _list_devices()
+    if not devices:
+        pytest.skip("no device to offload to")
+
+    device = devices[0]
+    preset_path = os.path.join(TMP_DIR, "test_per_device_many.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[dev-first]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            f"device = {device}\n"
+            "\n"
+            "[dev-second]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            f"device = {device}\n"
+        )
+
+    server.models_max_per_device = 2
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        _load_model_and_wait("dev-first", timeout=120)
+        _load_model_and_wait("dev-second", timeout=120)
+        assert _get_model_status("dev-first") == "loaded"
+        assert _get_model_status("dev-second") == "loaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_models_max_per_device_other_device():
+    """A model on another device is not affected by the limit."""
+    global server
+
+    devices = _list_devices()
+    if len(devices) < 2:
+        pytest.skip("needs two devices")
+
+    preset_path = os.path.join(TMP_DIR, "test_per_device_other.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[dev-first]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            f"device = {devices[0]}\n"
+            "\n"
+            "[dev-second]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            f"device = {devices[1]}\n"
+        )
+
+    server.models_max_per_device = 1
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        _load_model_and_wait("dev-first", timeout=120)
+        _load_model_and_wait("dev-second", timeout=120)
+        assert _get_model_status("dev-first") == "loaded"
+        assert _get_model_status("dev-second") == "loaded"
+    finally:
+        os.remove(preset_path)
+
+
+def test_router_model_group_on_one_device():
+    """A group on a device holds one model at a time, the group serves the loaded one."""
+    global server
+
+    devices = _list_devices()
+    if not devices:
+        pytest.skip("no device to offload to")
+
+    device = devices[0]
+    preset_path = os.path.join(TMP_DIR, "test_group_device.ini")
+    with open(preset_path, "w") as f:
+        f.write(
+            "[flash-first]\n"
+            "hf-repo = ggml-org/test-model-stories260K\n"
+            "model-group = flash\n"
+            f"device = {device}\n"
+            "\n"
+            "[flash-second]\n"
+            "hf-repo = ggml-org/test-model-stories260K-infill\n"
+            "model-group = flash\n"
+            f"device = {device}\n"
+        )
+
+    server.models_max_per_device = 1
+    server.models_preset = preset_path
+    server.start()
+
+    try:
+        # a request for the group loads the first member
+        res = server.make_request("POST", "/tokenize", data={"model": "flash", "content": "hello"})
+        assert res.status_code == 200
+        _wait_for_model_status("flash-first", {"loaded"}, timeout=120)
+
+        # asking for the other one by name takes the device from the first one
+        _load_model_and_wait("flash-second", timeout=120)
+        assert _get_model_status("flash-first") == "unloaded"
+        assert _get_model_status("flash-second") == "loaded"
+
+        # the group serves the member that is loaded
+        res = server.make_request("POST", "/tokenize", data={"model": "flash", "content": "hello"})
+        assert res.status_code == 200
+        assert _get_model_status("flash-second") == "loaded"
+        assert _get_model_status("flash-first") == "unloaded"
+    finally:
+        os.remove(preset_path)
+
+
 # server_lru_sched tests (relying on LLAMA_SERVER_DEBUG_FAKE_TIMING)
 
 MODEL_A = "ggml-org/tinygemma3-GGUF:Q8_0"
@@ -316,72 +665,6 @@ def test_router_queue_two_waiters_share_one_eviction():
     first.assert_ok("first queued request")
     second.assert_ok("second queued request")
     assert _get_model_status(MODEL_A) == "unloaded"
-
-
-# --models-memory-margin tests
-
-def _get_model_memory(model_id: str) -> dict:
-    res = server.make_request("GET", "/models")
-    assert res.status_code == 200
-    for item in res.body.get("data", []):
-        if item.get("id") == model_id:
-            return item["memory"]
-    raise AssertionError(f"Model {model_id} not found in /models response")
-
-
-def _wait_for_memory_status(model_id: str, desired: set[str], timeout: int = 120) -> dict:
-    deadline = time.time() + timeout
-    mem = None
-    while time.time() < deadline:
-        mem = _get_model_memory(model_id)
-        if mem["status"] in desired:
-            return mem
-        time.sleep(0.5)
-    raise AssertionError(f"memory status of {model_id} is {mem and mem['status']}, expected one of {desired}")
-
-
-def test_router_memory_margin_measures_models():
-    """every model is measured in the background on startup, a loaded instance reports what it allocated"""
-    global server
-    server.models_memory_margin = 1
-    server.start()
-
-    mem = _wait_for_memory_status(MODEL_B, {"measured", "failed"})
-    assert mem["status"] == "measured"
-    assert mem["effective"] is None
-    assert mem["min"]["n_ctx"] > 0
-    assert mem["max"]["n_ctx"] >= mem["min"]["n_ctx"]
-    kinds = {d["kind"] for d in mem["min"]["devices"]}
-    assert "host" in kinds
-    for d in mem["min"]["devices"]:
-        assert d["model"] + d["context"] + d["compute"] > 0 or d["kind"] != "host"
-
-    _load_model_and_wait(MODEL_B, timeout=120)
-    eff = _get_model_memory(MODEL_B)["effective"]
-    assert eff is not None
-    assert eff["n_ctx"] == mem["min"]["n_ctx"]  # the test preset pins -c, so min == max == effective
-
-    server.make_request("POST", "/models/unload", data={"model": MODEL_B})
-    _wait_for_model_status(MODEL_B, {"unloaded"})
-    assert _get_model_memory(MODEL_B)["effective"] is None
-
-
-def test_router_memory_margin_evicts_lru():
-    """with a margin larger than any device, two models never fit together: the idle one is unloaded"""
-    global server
-    server.models_max = 4
-    server.models_memory_margin = 1 << 30  # MiB
-    server.start()
-
-    # nothing else is loaded, so the model is loaded although it does not fit the margin
-    _load_model_and_wait(MODEL_B, timeout=120)
-    eff = _get_model_memory(MODEL_B)["effective"]
-    if not any(d["kind"] == "device" for d in eff["devices"]):
-        pytest.skip("no GPU device, the memory limit does not apply")  # ty: ignore[too-many-positional-arguments]
-
-    _load_model_and_wait(MODEL_C, timeout=120)
-    assert _get_model_status(MODEL_C) == "loaded"
-    assert _get_model_status(MODEL_B) == "unloaded"
 
 
 def test_router_no_models_autoload():

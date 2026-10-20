@@ -5,11 +5,8 @@
 #include "preset.h"
 #include "server-common.h"
 #include "server-http.h"
-#include "server-models-sched.h"
 #include "server-queue.h"
 
-#include <atomic>
-#include <deque>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
@@ -49,6 +46,11 @@ enum server_model_source {
     SERVER_MODEL_SOURCE_CACHE,
 };
 
+enum server_child_mode {
+    SERVER_CHILD_MODE_NORMAL,   // load the model and run normally
+    SERVER_CHILD_MODE_DOWNLOAD, // download the model and exit
+};
+
 static std::string server_model_status_to_string(server_model_status status) {
     switch (status) {
         case SERVER_MODEL_STATUS_DOWNLOADING: return "downloading";
@@ -76,7 +78,9 @@ struct server_model_meta {
     common_preset preset;
     std::string name;
     std::set<std::string> aliases; // additional names that resolve to this model
-    std::set<std::string> tags;    // informational tags, not used for routing
+    std::string group;              // name of the group this model belongs to, empty when it belongs to none
+    std::set<std::string> devices;  // devices the model is assigned to, empty when it is assigned to none
+    std::set<std::string> tags;     // informational tags, not used for routing
     int port = 0;
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0; // for LRU unloading
@@ -88,9 +92,6 @@ struct server_model_meta {
     bool hidden = false; // hidden from GET /models, but still accept if requested
     json architecture = server_model_architecture_json(false, false, false, {"text"});
     uint32_t n_ctx_train = 0; // trained context, read from the GGUF metadata; 0 when unknown
-
-    // only populated with --models-memory-margin, see server_models_sched
-    server_model_memory_info memory = {};
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -111,6 +112,22 @@ struct server_model_meta {
     void update_args(common_preset_context & ctx_presets, std::string bin_path);
     void update_caps(const common_params & base);
 };
+
+// resolve a requested name to a canonical model name
+// a canonical name resolves to itself
+// a group name resolves to the member of the group that serves it: the loaded
+// one, else the one that is coming up, else the first one
+// an alias resolves to the model that declares it
+// returns an empty string when the name is unknown
+std::string server_model_resolve_name(const std::string & name, const std::vector<const server_model_meta *> & models);
+
+// the models that have to go for `name` to be loaded, the ones that hold a device
+// it needs while that device is full
+// the least recently used ones go first
+std::vector<std::string> server_model_device_conflicts(
+        const std::string & name,
+        const std::vector<const server_model_meta *> & models,
+        int max_per_device);
 
 // a download that never finished: the tag it was asked under, the sidecar kinds it
 // pulls and the partial files its plan writes
@@ -158,11 +175,12 @@ private:
 };
 
 struct server_models_routes;
-struct server_monitor; // defined in server-models.cpp
+struct server_lru_sched; // defined in server-models.cpp
+struct server_monitor;   // defined in server-models.cpp
 
 struct server_models {
     friend struct server_models_routes;
-    friend struct server_models_sched;
+    friend struct server_lru_sched;
     friend struct server_monitor;
 
 private:
@@ -171,7 +189,7 @@ private:
         server_model_meta meta;
         int req_count = 0; // number of active proxy requests
 
-        // ask the child to exit (it handles the command on its stdin, see server_role::setup)
+        // ask the child to exit (it handles the command on its stdin, see server_child::setup)
         void request_exit() const;
     };
 
@@ -257,26 +275,39 @@ private:
     std::vector<std::string> base_env;
     common_preset base_preset; // base preset from llama-server CLI args
 
-    // request queue (models_max) and memory accounting
-    std::unique_ptr<server_models_sched> sched;
+    // queue of requests waiting for a models_max slot
+    std::unique_ptr<server_lru_sched> sched;
 
     // if true, add some delay to simulate works (useful for testing)
     bool debug_fake_timing = false;
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
+    // unload least recently used models if the limit is reached
+    void unload_lru();
+
     // not thread-safe, caller must hold mutex
     void add_model(server_model_meta && meta);
+
+    // resolve a requested name to a canonical model name
+    // empty when the name is unknown
+    // not thread-safe, caller must hold mutex
+    std::string resolve_name(const std::string & name) const;
+
+    // the running models that hold a device of `name` and are over the per device limit
+    // not thread-safe, caller must hold mutex
+    std::vector<std::string> device_conflicts(const std::string & name) const;
+
+    // wait until the devices of the model have room, the models that hold them are stopped
+    // not thread-safe, caller must hold mutex
+    void free_devices(std::unique_lock<std::mutex> & lk, const std::string & name);
 
     // ask the monitor to stop a running instance; send_exit is false for a child that was already force-killed
     // not thread-safe, caller must hold mutex
     void request_stop(const std::string & name, bool send_exit = true);
 
-    // let the monitor watch a child; kill_after > 0 force-kills it after that many seconds
-    void watch_child(const std::string & name, std::shared_ptr<server_subproc> proc, server_role_type role, int port, int kill_after = 0);
-
     // called by the monitor once a child exited and was reaped
-    void on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_role_type role, int exit_code);
+    void on_child_exit(const std::string & name, const std::shared_ptr<server_subproc> & proc, server_child_mode mode, int exit_code);
 
     // notify SSE clients
     void notify_sse(const std::string & event, const std::string & model_id, const json & data = nullptr);
@@ -320,7 +351,7 @@ public:
     std::vector<server_model_meta> get_all_meta();
 
     struct load_options {
-        server_role_type role = SERVER_ROLE_INSTANCE;
+        server_child_mode mode = SERVER_CHILD_MODE_NORMAL;
         // used for spawning a downloading child process
         std::optional<server_model_meta> custom_meta = std::nullopt;
         // download mode: the sidecar kinds pulled with the model, as -hf would, and
@@ -341,7 +372,6 @@ public:
         int exit_code = 0; // only valid if status == UNLOADED
         json loaded_info = nullptr;
         json progress = nullptr;
-        std::optional<server_model_memory> memory = std::nullopt; // what the instance allocated, sent with READY
     };
     // update the status of a model instance (thread-safe)
     // also send SSE notification to /models/sse endpoint
@@ -370,19 +400,45 @@ public:
     // forward a websocket connection to the child, returns when either side closes
     void proxy_ws(const server_http_req & req, server_http_context::ws_conn & conn, const std::string & name);
 
-    // handle message sent from server_role::notify_to_router()
+    // handle message sent from server_child::notify_to_router()
     // raw input must starts with CMD_CHILD_TO_ROUTER_STATE, followed by a JSON string
     // called from the monitor thread
     // payload per state:
     //     state = loading     -> payload = {} (TODO: add progress info)
-    //     state = ready       -> payload = model_info (json) with a "memory" field, or {} if wakeup from sleeping
+    //     state = ready       -> payload = model_info (json), or {} if wakeup from sleeping
     //     state = sleeping    -> payload = {}
-    //     state = measuring   -> payload = {result: "measured", min, max} or {result: "failed", error}
     void handle_child_state(const std::string & name, const std::string & raw_input);
 
 private:
     // one thread watching every child; keep last, the destructor joins the thread
     std::unique_ptr<server_monitor> monitor;
+};
+
+struct server_child {
+    // serializes the notify_to_router writes
+    std::mutex mtx_stdout;
+    std::atomic<bool> is_finished_downloading = false; // set by run_download
+
+    // in a child, keeps stdout for the commands to the router, so it is created before anything is written;
+    // everything else written to stdout goes to stderr with the logs
+    server_child();
+    ~server_child();
+
+    // return true if the current process is a child server instance
+    bool is_child();
+    server_child_mode get_mode();
+    int run_download(common_params & params);
+
+    // register the shutdown_handler to be called by the router
+    // return the monitoring thread (to be joined by the caller)
+    std::thread setup(const std::function<void(int)> & shutdown_handler);
+
+    // notify router server for status changes (e.g. loading, downloading, sleeping, etc.)
+    // message will be handled by server_models::handle_child_state() on the router side
+    void notify_to_router(const std::string & state_name, const json & payload);
+
+private:
+    FILE * cmd_out = nullptr; // the stdout the router reads the commands from
 };
 
 struct server_models_routes {
