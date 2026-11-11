@@ -657,6 +657,10 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     bool    cache_ram_explicit  = false; // set by --cache-ram, decision models disable the cache otherwise
 
+    // disk-based context checkpoints (useful on UMA systems where RAM is VRAM)
+    std::string cache_disk      = "";   // directory for disk-based context checkpoints (default: disabled)
+    int32_t     cache_disk_max_mib = -1; // max disk space for checkpoints in MiB (<= 0 = no limit)
+
     // llama-connect params
     bool        server_connect      = false;
     std::string server_connect_code = "";

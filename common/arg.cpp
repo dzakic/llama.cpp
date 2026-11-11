@@ -1693,6 +1693,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"-cdisk", "--cache-disk"}, "PATH",
+        string_format("directory for disk-based context checkpoints (default: disabled)"),
+        [](common_params & params, const std::string & value) {
+            params.cache_disk = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-cdmax", "--cache-disk-max"}, "N",
+        string_format("maximum disk space for context checkpoints in MiB (default: %d, <= 0 - no limit)", params.cache_disk_max_mib),
+        [](common_params & params, int value) {
+            params.cache_disk_max_mib = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_DISK_MAX").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

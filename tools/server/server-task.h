@@ -5,8 +5,10 @@
 
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <list>
 #include <map>
+#include <cstdint>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -755,6 +757,71 @@ struct server_prompt_cache {
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
     void update();
+};
+
+// A single persistent checkpoint cache entry, stored on disk as <hash>.pcck
+// and kept in memory as a lightweight index entry (metadata only; blob data
+// is read from disk on demand when the entry is matched).
+struct server_persistent_checkpoint_entry {
+    std::string hash;           // fnv-1a hex hash of the prompt tokens
+    std::string model_fingerprint; // fingerprint of the model file (path+size+mtime)
+    server_tokens tokens;       // full prompt tokens (for prefix matching)
+    int64_t    n_tokens = 0;    // prompt length
+    int64_t    last_access_us = 0;
+    std::string path;           // on-disk file path
+    size_t     disk_size = 0;   // on-disk file size in bytes
+};
+
+// Persistent checkpoint cache: survives server restarts, keyed by prompt content.
+// Entries are stored on disk; only the metadata index is kept in RAM.
+// Entries are scoped to a single model fingerprint - entries from a different
+// model/quant are never matched.
+struct server_persistent_checkpoint_cache {
+    server_persistent_checkpoint_cache(std::string dir, size_t max_size_bytes, std::string model_fingerprint);
+
+    // Look up the entry whose prompt is the longest common prefix of `tokens`.
+    // Returns nullptr if no entry matches (or fingerprint mismatch). Updates last_access_us on hit.
+    server_persistent_checkpoint_entry * lookup(const server_tokens & tokens);
+
+    // Store a new entry (or replace an existing one with the same hash).
+    // Evicts LRU entries if the total disk size exceeds max_size_bytes.
+    void store(const server_tokens & tokens,
+               const std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints);
+
+    // Remove an entry by hash.
+    void erase(const std::string & hash);
+
+    // Total on-disk bytes currently used.
+    size_t size() const { return current_size_bytes; }
+
+    // Scan the directory on startup and rebuild the in-memory index.
+    // Skips entries whose model_fingerprint does not match the current model.
+    void load_all();
+
+    // Read checkpoint blobs from a .pcck file (metadata only is in the entry;
+    // this loads the actual state data from disk on demand).
+    bool load_checkpoints_from_disk(
+            const std::string & path,
+            std::list<std::shared_ptr<common_prompt_checkpoint>> & checkpoints) const;
+
+private:
+    std::string dir;
+    std::string model_fingerprint;
+    size_t max_size_bytes = 0;
+    size_t current_size_bytes = 0;
+
+    // LRU ordered: front = oldest, back = newest
+    std::list<server_persistent_checkpoint_entry> entries;
+    std::unordered_map<std::string, std::list<server_persistent_checkpoint_entry>::iterator> index;
+
+    static std::string hash_tokens(const server_tokens & tokens);
+    static std::string entry_path(const std::string & dir, const std::string & hash);
+
+    bool read_entry(const std::string & path, server_persistent_checkpoint_entry & entry) const;
+    bool write_entry(const std::string & path, const server_tokens & tokens,
+                     const std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints,
+                     int64_t last_access_us, const std::string & model_fingerprint);
+    void evict_lru(size_t needed_bytes);
 };
 
 // used exclusively by router mode

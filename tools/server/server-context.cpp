@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <chrono>
 #include <deque>
 #include <exception>
 #include <memory>
@@ -1114,6 +1115,9 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    // persistent checkpoint cache: survives server restarts, stored on disk
+    std::unique_ptr<server_persistent_checkpoint_cache> prompt_cache_disk;
+
     server_metrics metrics;
 
     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
@@ -1136,6 +1140,16 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        // persist active slot checkpoints to disk before destroying the context,
+        // so that conversations can be resumed after a server restart
+        if (prompt_cache_disk) {
+            for (auto & slot : slots) {
+                if (!slot.is_processing() && !slot.prompt.checkpoints.empty()) {
+                    prompt_cache_disk->store(slot.prompt.tokens, slot.prompt.checkpoints);
+                }
+            }
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -1611,6 +1625,58 @@ private:
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+
+            if (!params_base.cache_disk.empty()) {
+                const size_t max_bytes = params_base.cache_disk_max_mib <= 0 ?
+                        (size_t)-1 : (size_t)params_base.cache_disk_max_mib * 1024ull * 1024ull;
+                // fingerprint = model path + size + mtime, so entries from a different
+                // model or quant are never matched after a restart
+                std::string model_fingerprint = params_base.model.path;
+                std::error_code ec;
+                auto fsize = std::filesystem::file_size(params_base.model.path, ec);
+                if (!ec) {
+                    model_fingerprint += ":" + std::to_string(fsize);
+                }
+                auto mtime = std::filesystem::last_write_time(params_base.model.path, ec);
+                if (!ec) {
+                    model_fingerprint += ":" + std::to_string(
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            mtime.time_since_epoch()).count());
+                }
+                // KV cache quantization types affect the KV state tensor format,
+                // so they must be part of the fingerprint as well
+                model_fingerprint += ":" + std::string(ggml_type_name(params_base.cache_type_k));
+                model_fingerprint += ":" + std::string(ggml_type_name(params_base.cache_type_v));
+
+                // draft model fingerprint (speculative decoding KV/spec state is draft-specific)
+                const auto & draft = params_base.speculative.draft;
+                if (!draft.mparams.path.empty()) {
+                    model_fingerprint += ":draft=" + draft.mparams.path;
+                    auto dfsize = std::filesystem::file_size(draft.mparams.path, ec);
+                    if (!ec) {
+                        model_fingerprint += ":" + std::to_string(dfsize);
+                    }
+                    auto dmtime = std::filesystem::last_write_time(draft.mparams.path, ec);
+                    if (!ec) {
+                        model_fingerprint += ":" + std::to_string(
+                            std::chrono::duration_cast<std::chrono::seconds>(
+                                dmtime.time_since_epoch()).count());
+                    }
+                    model_fingerprint += ":" + std::string(ggml_type_name(draft.cache_type_k));
+                    model_fingerprint += ":" + std::string(ggml_type_name(draft.cache_type_v));
+                }
+
+                // speculative decoding type affects data_spec format (eagle3 g_embd rows vs mtp, etc.)
+                for (const auto & st : params_base.speculative.types) {
+                    model_fingerprint += ":spec=" + std::to_string((int) st);
+                }
+                prompt_cache_disk = std::make_unique<server_persistent_checkpoint_cache>(
+                        params_base.cache_disk, max_bytes, model_fingerprint);
+                prompt_cache_disk->load_all();
+                SRV_INF("persistent checkpoint cache enabled: dir='%s', max=%.3f MiB\n",
+                        params_base.cache_disk.c_str(),
+                        params_base.cache_disk_max_mib <= 0 ? -1.0f : (float)params_base.cache_disk_max_mib);
+            }
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -1890,6 +1956,11 @@ private:
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
+
+                // persist the slot's checkpoints to disk before they are overwritten/cleared
+                if (prompt_cache_disk && !ret->prompt.checkpoints.empty()) {
+                    prompt_cache_disk->store(ret->prompt.tokens, ret->prompt.checkpoints);
+                }
 
                 ret->prompt_save(*prompt_cache);
 
@@ -3059,6 +3130,52 @@ private:
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
                         queue_tasks.defer(std::move(task));
                         break;
+                    }
+
+                    // restore context checkpoints from the persistent disk cache when the slot was
+                    // cleared and no RAM cache match was found. this allows a resumed conversation
+                    // to skip re-processing of the shared prompt prefix, even after a server restart.
+                    if (prompt_cache_disk && slot->prompt.tokens.empty()) {
+                        if (auto * entry = prompt_cache_disk->lookup(task.tokens)) {
+                            const int lcp = entry->tokens.get_common_prefix(task.tokens);
+                            // only use the entry if the saved prompt is a full prefix of the new one
+                            if (lcp == (int) entry->tokens.size()) {
+                                std::list<std::shared_ptr<common_prompt_checkpoint>> checkpoints;
+                                if (prompt_cache_disk->load_checkpoints_from_disk(entry->path, checkpoints)) {
+                                    // load the saved prompt tokens into the slot
+                                    slot->prompt.tokens = server_tokens(entry->tokens.get_tokens(), false);
+
+                                    // move the restored checkpoints into the slot
+                                    slot->prompt.checkpoints.clear();
+                                    for (auto & ckpt : checkpoints) {
+                                        slot->prompt.checkpoints.push_back(std::move(ckpt));
+                                    }
+
+                                    // restore the best matching checkpoint into the context
+                                    auto best_it = slot->prompt.checkpoints.rend();
+                                    for (auto it = slot->prompt.checkpoints.rbegin();
+                                            it != slot->prompt.checkpoints.rend(); ++it) {
+                                        if ((*it)->n_tokens <= lcp) {
+                                            best_it = it;
+                                            break;
+                                        }
+                                    }
+
+                                    if (best_it != slot->prompt.checkpoints.rend()) {
+                                        const auto & cur = **best_it;
+                                        if (cur.load_tgt(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                                            if (ctx_dft) {
+                                                cur.load_dft(ctx_dft, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            }
+                                            common_speculative_set_state(spec.get(), slot->id, cur.data_spec);
+                                            SLT_INF(*slot, "restored persistent checkpoint from disk (hash=%s, "
+                                                    "n_tokens=%" PRId64 ", lcp=%d)\n",
+                                                    entry->hash.c_str(), cur.n_tokens, lcp);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     if (task.is_parent()) {

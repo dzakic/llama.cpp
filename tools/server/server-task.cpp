@@ -11,6 +11,11 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <fstream>
+#include <filesystem>
+#include <chrono>
+#include <cstring>
+#include <cstdio>
 
 //
 // task_params
@@ -1951,4 +1956,387 @@ void server_prompt_cache::update() {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+}
+
+//
+// server_persistent_checkpoint_cache
+//
+
+static constexpr uint32_t PCCK_MAGIC   = 0x50434b43; // "PCKP"
+static constexpr uint32_t PCCK_VERSION = 1;
+
+static std::string pckk_model_fingerprint(const std::string & model_path) {
+    std::string fp = model_path;
+    std::error_code ec;
+    auto fsize = std::filesystem::file_size(model_path, ec);
+    if (!ec) {
+        fp += ":" + std::to_string(fsize);
+    }
+    auto mtime = std::filesystem::last_write_time(model_path, ec);
+    if (!ec) {
+        fp += ":" + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(
+            mtime.time_since_epoch()).count());
+    }
+    return fp;
+}
+
+static std::string pckk_hash_tokens(const server_tokens & tokens) {    const uint64_t fnv_offset = 14695981039346656037ULL;
+    const uint64_t fnv_prime  = 1099511628211ULL;
+    uint64_t hash = fnv_offset;
+
+    const llama_tokens & tok = tokens.get_tokens();
+    const uint8_t * bytes = (const uint8_t *)tok.data();
+    const size_t n_bytes = tok.size() * sizeof(llama_token);
+    for (size_t i = 0; i < n_bytes; ++i) {
+        hash ^= bytes[i];
+        hash *= fnv_prime;
+    }
+
+    char buf[17];
+    std::snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)hash);
+    return std::string(buf);
+}
+
+server_persistent_checkpoint_cache::server_persistent_checkpoint_cache(std::string dir, size_t max_size_bytes, std::string model_fingerprint)
+    : dir(std::move(dir)), model_fingerprint(std::move(model_fingerprint)), max_size_bytes(max_size_bytes) {
+}
+
+std::string server_persistent_checkpoint_cache::entry_path(const std::string & dir, const std::string & hash) {
+    return (std::filesystem::path(dir) / (hash + ".pcck")).string();
+}
+
+bool server_persistent_checkpoint_cache::write_entry(const std::string & path, const server_tokens & tokens,
+        const std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints, int64_t last_access_us,
+        const std::string & model_fingerprint) {
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) {
+        return false;
+    }
+
+    const uint32_t magic   = PCCK_MAGIC;
+    const uint32_t version = PCCK_VERSION;
+    const uint64_t n_tokens   = (uint64_t)tokens.size();
+    const uint64_t n_prompt   = (uint64_t)tokens.get_tokens().size();
+    const uint32_t n_ckpts    = (uint32_t)checkpoints.size();
+
+    ofs.write((const char *)&magic,   sizeof(magic));
+    ofs.write((const char *)&version, sizeof(version));
+    ofs.write((const char *)&n_tokens, sizeof(n_tokens));
+    ofs.write((const char *)&last_access_us, sizeof(last_access_us));
+    ofs.write((const char *)&n_prompt, sizeof(n_prompt));
+
+    // write model fingerprint length + data
+    const uint64_t fp_len = (uint64_t)model_fingerprint.size();
+    ofs.write((const char *)&fp_len, sizeof(fp_len));
+    if (fp_len > 0) {
+        ofs.write(model_fingerprint.data(), fp_len);
+    }
+
+    if (n_prompt > 0) {
+        ofs.write((const char *)tokens.get_tokens().data(), n_prompt * sizeof(llama_token));
+    }
+    ofs.write((const char *)&n_ckpts, sizeof(n_ckpts));
+
+    for (const auto & ckpt : checkpoints) {
+        const auto & cur = *ckpt;
+        const int64_t ck_n_tokens = cur.n_tokens;
+        const int64_t ck_pos_min  = cur.pos_min;
+        const int64_t ck_pos_max  = cur.pos_max;
+        ofs.write((const char *)&ck_n_tokens, sizeof(ck_n_tokens));
+        ofs.write((const char *)&ck_pos_min,  sizeof(ck_pos_min));
+        ofs.write((const char *)&ck_pos_max,  sizeof(ck_pos_max));
+
+        auto write_blob = [&](const uint8_t * data, uint64_t n) {
+            ofs.write((const char *)&n, sizeof(n));
+            if (n > 0) {
+                ofs.write((const char *)data, n);
+            }
+            return ofs.good();
+        };
+
+        if (!write_blob(cur.data_tgt.data(), (uint64_t)cur.data_tgt.size()) ||
+            !write_blob(cur.data_dft.data(), (uint64_t)cur.data_dft.size()) ||
+            !write_blob(cur.data_spec.data(), (uint64_t)cur.data_spec.size())) {
+            return false;
+        }
+    }
+
+    ofs.flush();
+    return ofs.good();
+}
+
+bool server_persistent_checkpoint_cache::read_entry(const std::string & path, server_persistent_checkpoint_entry & entry) const {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) {
+        return false;
+    }
+
+    uint32_t magic   = 0;
+    uint32_t version = 0;
+    if (!ifs.read((char *)&magic, sizeof(magic)) || magic != PCCK_MAGIC ||
+        !ifs.read((char *)&version, sizeof(version)) || version != PCCK_VERSION) {
+        return false;
+    }
+
+    uint64_t n_tokens   = 0;
+    uint64_t last_access = 0;
+    uint64_t n_prompt   = 0;
+    uint32_t n_ckpts    = 0;
+    if (!ifs.read((char *)&n_tokens, sizeof(n_tokens)) ||
+        !ifs.read((char *)&last_access, sizeof(last_access)) ||
+        !ifs.read((char *)&n_prompt, sizeof(n_prompt))) {
+        return false;
+    }
+
+    // read model fingerprint length + data
+    uint64_t fp_len = 0;
+    if (!ifs.read((char *)&fp_len, sizeof(fp_len)) || fp_len > 1024) {
+        return false;
+    }
+    std::string fp;
+    fp.resize(fp_len);
+    if (fp_len > 0 && !ifs.read((char *)fp.data(), fp_len)) {
+        return false;
+    }
+
+    llama_tokens tok;
+    tok.resize(n_prompt);
+    if (n_prompt > 0 && !ifs.read((char *)tok.data(), n_prompt * sizeof(llama_token))) {
+        return false;
+    }
+
+    entry.n_tokens   = (int64_t)n_tokens;
+    entry.last_access_us = (int64_t)last_access;
+    entry.model_fingerprint = std::move(fp);
+    entry.tokens = server_tokens(tok, false);
+    entry.path   = path;
+    entry.disk_size = (size_t)std::filesystem::file_size(path);
+
+    // skip checkpoint data - we only need metadata for the index
+    for (uint32_t i = 0; i < n_ckpts; ++i) {
+        int64_t ck_n_tokens = 0, ck_pos_min = 0, ck_pos_max = 0;
+        if (!ifs.read((char *)&ck_n_tokens, sizeof(ck_n_tokens)) ||
+            !ifs.read((char *)&ck_pos_min,  sizeof(ck_pos_min))  ||
+            !ifs.read((char *)&ck_pos_max,  sizeof(ck_pos_max))) {
+            return false;
+        }
+        for (int b = 0; b < 3; ++b) {
+            uint64_t n = 0;
+            if (!ifs.read((char *)&n, sizeof(n))) {
+                return false;
+            }
+            ifs.seekg(n, std::ios::cur);
+            if (!ifs) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+void server_persistent_checkpoint_cache::load_all() {
+    std::error_code ec;
+    for (const auto & entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        if (name.size() <= 4 || name.substr(name.size() - 4) != ".pcck") {
+            continue;
+        }
+        const std::string hash = name.substr(0, name.size() - 4);
+
+        server_persistent_checkpoint_entry ent;
+        ent.hash = hash;
+        ent.path = entry.path().string();
+        if (!read_entry(entry.path().string(), ent)) {
+            SRV_WRN("failed to read persistent checkpoint entry '%s' - ignored\n", entry.path().string().c_str());
+            std::filesystem::remove(entry.path(), ec);
+            continue;
+        }
+
+        // skip entries from a different model/quant
+        if (ent.model_fingerprint != model_fingerprint) {
+            SRV_TRC("persistent checkpoint cache: skipping entry hash=%s from different model fingerprint\n",
+                    hash.c_str());
+            continue;
+        }
+
+        current_size_bytes += ent.disk_size;
+        auto it = entries.insert(entries.end(), std::move(ent));
+        index.emplace(hash, it);
+    }
+
+    SRV_INF("persistent checkpoint cache: %zu entries, %.3f MiB in '%s'\n",
+            entries.size(), current_size_bytes / (1024.0 * 1024.0), dir.c_str());
+}
+
+void server_persistent_checkpoint_cache::evict_lru(size_t needed_bytes) {
+    while (!entries.empty() && current_size_bytes + needed_bytes > max_size_bytes) {
+        auto & front = entries.front();
+        SRV_WRN("persistent checkpoint cache: evicting LRU entry (hash=%s, size=%.3f MiB)\n",
+                front.hash.c_str(), front.disk_size / (1024.0 * 1024.0));
+        std::error_code ec;
+        std::filesystem::remove(front.path, ec);
+        current_size_bytes -= front.disk_size;
+        index.erase(front.hash);
+        entries.pop_front();
+    }
+}
+
+void server_persistent_checkpoint_cache::erase(const std::string & hash) {
+    auto it = index.find(hash);
+    if (it == index.end()) {
+        return;
+    }
+    auto & ent = *it->second;
+    std::error_code ec;
+    std::filesystem::remove(ent.path, ec);
+    current_size_bytes -= ent.disk_size;
+    index.erase(it);
+    entries.erase(it->second);
+}
+
+server_persistent_checkpoint_entry * server_persistent_checkpoint_cache::lookup(const server_tokens & tokens) {
+    server_persistent_checkpoint_entry * best = nullptr;
+    int best_lcp = -1;
+    auto best_it = entries.end();
+
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        const int lcp = it->tokens.get_common_prefix(tokens);
+        if (lcp > 0 && lcp > best_lcp) {
+            best_lcp  = lcp;
+            best      = &(*it);
+            best_it   = it;
+        }
+    }
+
+    if (best) {
+        best->last_access_us = ggml_time_us();
+        entries.splice(entries.end(), entries, best_it);
+    }
+
+    return best;
+}
+
+void server_persistent_checkpoint_cache::store(const server_tokens & tokens,
+        const std::list<std::shared_ptr<const common_prompt_checkpoint>> & checkpoints) {
+    if (checkpoints.empty()) {
+        return;
+    }
+
+    const std::string hash = pckk_hash_tokens(tokens);
+    const std::string path = entry_path(dir, hash);
+
+    // check if entry already exists
+    auto mit = index.find(hash);
+    if (mit != index.end()) {
+        // replace existing entry
+        auto & old_ent = *mit->second;
+        current_size_bytes -= old_ent.disk_size;
+        std::error_code ec;
+        std::filesystem::remove(old_ent.path, ec);
+        entries.erase(mit->second);
+        index.erase(mit);
+    }
+
+    // write to disk
+    const int64_t now = ggml_time_us();
+    if (!write_entry(path, tokens, checkpoints, now, model_fingerprint)) {
+        SRV_WRN("failed to write persistent checkpoint entry '%s'\n", path.c_str());
+        return;
+    }
+
+    size_t disk_size = (size_t)std::filesystem::file_size(path);
+
+    // evict LRU if needed
+    evict_lru(disk_size);
+
+    // add to index (back = newest)
+    server_persistent_checkpoint_entry ent;
+    ent.hash          = hash;
+    ent.tokens        = server_tokens(tokens.get_tokens(), false);
+    ent.n_tokens      = (int64_t)tokens.size();
+    ent.last_access_us = now;
+    ent.path          = path;
+    ent.disk_size     = disk_size;
+
+    auto it = entries.insert(entries.end(), std::move(ent));
+    index.emplace(hash, it);
+    current_size_bytes += disk_size;
+
+    SRV_INF("persistent checkpoint cache: stored entry hash=%s, tokens=%" PRId64 ", size=%.3f MiB\n",
+            hash.c_str(), ent.n_tokens, disk_size / (1024.0 * 1024.0));
+}
+
+bool server_persistent_checkpoint_cache::load_checkpoints_from_disk(
+        const std::string & path,
+        std::list<std::shared_ptr<common_prompt_checkpoint>> & checkpoints) const {
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) {
+        return false;
+    }
+
+    uint32_t magic   = 0;
+    uint32_t version = 0;
+    if (!ifs.read((char *)&magic, sizeof(magic)) || magic != PCCK_MAGIC ||
+        !ifs.read((char *)&version, sizeof(version)) || version != PCCK_VERSION) {
+        return false;
+    }
+
+    // skip header: n_tokens, last_access, n_prompt, prompt_tokens
+    uint64_t n_tokens = 0, last_access = 0, n_prompt = 0;
+    if (!ifs.read((char *)&n_tokens, sizeof(n_tokens)) ||
+        !ifs.read((char *)&last_access, sizeof(last_access)) ||
+        !ifs.read((char *)&n_prompt, sizeof(n_prompt))) {
+        return false;
+    }
+    ifs.seekg(n_prompt * sizeof(llama_token), std::ios::cur);
+    if (!ifs) {
+        return false;
+    }
+
+    uint32_t n_ckpts = 0;
+    if (!ifs.read((char *)&n_ckpts, sizeof(n_ckpts))) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < n_ckpts; ++i) {
+        auto ckpt = std::make_shared<common_prompt_checkpoint>();
+        auto & cur = *ckpt;
+
+        int64_t ck_n_tokens = 0, ck_pos_min = 0, ck_pos_max = 0;
+        if (!ifs.read((char *)&ck_n_tokens, sizeof(ck_n_tokens)) ||
+            !ifs.read((char *)&ck_pos_min,  sizeof(ck_pos_min))  ||
+            !ifs.read((char *)&ck_pos_max,  sizeof(ck_pos_max))) {
+            return false;
+        }
+        cur.update_pos(ck_n_tokens, ck_pos_min, ck_pos_max);
+
+        auto read_blob = [&](auto & buf) {
+            uint64_t n = 0;
+            if (!ifs.read((char *)&n, sizeof(n))) {
+                return false;
+            }
+            buf.resize(n);
+            if (n > 0 && !ifs.read((char *)buf.data(), n)) {
+                return false;
+            }
+            return true;
+        };
+
+        if (!read_blob(cur.data_tgt) ||
+            !read_blob(cur.data_dft) ||
+            !read_blob(cur.data_spec)) {
+            return false;
+        }
+
+        checkpoints.push_back(std::move(ckpt));
+    }
+
+    return true;
 }
