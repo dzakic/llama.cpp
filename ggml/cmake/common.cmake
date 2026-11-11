@@ -2,29 +2,36 @@ function(ggml_get_flags CCID CCVER)
     set(C_FLAGS "")
     set(CXX_FLAGS "")
 
+    # CXX flags come from the CXX compiler ID (arg), C flags from the C compiler ID (global).
+    # Splitting them so mixed toolchains (e.g. gcc for C and IntelLLVM for CXX) get correct
+    # flags: gcc must not receive icpx's clang-only flags (-Wunreachable-code-* / -R...).
     if (CCID MATCHES "Clang" OR CCID MATCHES "IntelLLVM")
-        set(C_FLAGS   -Wunreachable-code-break -Wunreachable-code-return)
         set(CXX_FLAGS -Wunreachable-code-break -Wunreachable-code-return -Wmissing-prototypes -Wextra-semi)
-
         if (CCID STREQUAL "IntelLLVM")
             # for Intel DPC++ and LLVM SYCL, using debug does not disable optimization
-            list(APPEND C_FLAGS    -Rno-debug-disables-optimization)
             list(APPEND CXX_FLAGS  -Rno-debug-disables-optimization)
         endif()
-
-        if (
-            (CCID STREQUAL "Clang"      AND CCVER VERSION_GREATER_EQUAL 3.8.0) OR
-            (CCID STREQUAL "AppleClang" AND CCVER VERSION_GREATER_EQUAL 7.3.0)
-        )
-            list(APPEND C_FLAGS -Wdouble-promotion)
-        endif()
     elseif (CCID STREQUAL "GNU")
-        set(C_FLAGS   -Wdouble-promotion)
         set(CXX_FLAGS -Wno-array-bounds)
-
         if (CCVER VERSION_GREATER_EQUAL 8.1.0)
             list(APPEND CXX_FLAGS -Wextra-semi)
         endif()
+    endif()
+
+    if (CMAKE_C_COMPILER_ID MATCHES "Clang" OR CMAKE_C_COMPILER_ID MATCHES "IntelLLVM")
+        set(C_FLAGS   -Wunreachable-code-break -Wunreachable-code-return)
+        if (CMAKE_C_COMPILER_ID STREQUAL "IntelLLVM")
+            list(APPEND C_FLAGS    -Rno-debug-disables-optimization)
+        endif()
+
+        if (
+            (CMAKE_C_COMPILER_ID STREQUAL "Clang"      AND CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 3.8.0) OR
+            (CMAKE_C_COMPILER_ID STREQUAL "AppleClang" AND CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 7.3.0)
+        )
+            list(APPEND C_FLAGS -Wdouble-promotion)
+        endif()
+    elseif (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+        set(C_FLAGS -Wdouble-promotion)
     endif()
 
     set(GF_C_FLAGS   ${C_FLAGS}   PARENT_SCOPE)
