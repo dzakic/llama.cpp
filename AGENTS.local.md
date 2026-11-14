@@ -19,6 +19,6 @@ Full workflow: `skills/fork-upstream-sync/SKILL.md`. Short version:
   scripts. `origin/master` mirrors `master`.
 - Private features (task queue + `--cache-disk`, gcc/icpx build fix, router shared-name) are
   committed on `master`, absent from upstream.
-- Weekly sync: `./local-update.sh` (fetch + rebase `master` onto upstream + push). Rebuild:
-  `./local-build.sh` (incremental by default; `--clean` for a full wipe).
+- Weekly sync: `./local-update.sh` (fetch + merge `upstream/master` into `master` + push).
+  Rebuild: `./local-build.sh` (incremental by default; `--clean` for a full wipe).
 - The only realistic conflict is `tools/server/server-models.cpp` (see the skill).

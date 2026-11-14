@@ -14,7 +14,8 @@ description: Keep dzakic/llama.cpp (origin) chasing ggml-org/llama.cpp (upstream
   `origin/master` mirrors `master`.
 
 The build branch (`master`) is the only branch that matters. Private features sit on top of
-upstream as a few clean commits; chasing upstream rebases them onto the newest upstream.
+upstream as a few clean commits; chasing upstream merges the newest upstream in (keeping the
+local edits on top).
 
 ## Private features (committed on `master`, absent from upstream)
 
@@ -34,9 +35,9 @@ Describe by name, not hash (hashes change on rebase):
 ./local-update.sh --no-push  # same, but review before pushing
 ```
 
-`local-update.sh` does: `git fetch upstream`, `git rebase --no-merges upstream/master master`
-(replays the 3 feature commits onto new upstream, dropping old sync-point merges), then pushes
-`master -> origin/master --force-with-lease`. Then rebuild:
+`local-update.sh` does: `git fetch upstream`, `git merge --no-ff upstream/master` (keeps the
+3 feature commits + local scripts on top), then pushes `master -> origin/master
+--force-with-lease`. Then rebuild:
 
 ```sh
 ./local-build.sh             # incremental; only changed files recompile
@@ -45,7 +46,7 @@ Describe by name, not hash (hashes change on rebase):
 ## Conflict resolution (server-models.cpp)
 
 The only file that realistically conflicts: upstream refactored it while the router shared-name
-feature edited it. When rebase stops, reconstruct git's true 3-way merge instead of taking one
+feature edited it. When merge stops, reconstruct git's true 3-way merge instead of taking one
 side wholesale:
 
 ```sh
@@ -65,6 +66,8 @@ before continuing.
 
 - Do not let `local-build.sh` auto-merge upstream on every build. Chasing upstream is the
   deliberate `local-update.sh` step; the build script only builds the current checkout.
+- Do not `git rebase --no-merges` to chase upstream on this repo: this git build lacks that
+  option, and the local helper scripts live in the merge history (a merge keeps them).
 - Do not squash private commits into upstream commits; keep them a distinct, rebasable layer.
 - Do not push a half-resolved rebase. Verify `--cache-disk` survived and the build installs:
   ```sh
@@ -74,12 +77,12 @@ before continuing.
 
 ## If history gets messy
 
-If a merge left `master` as a long mixed history with merge commits on top of features:
+If a merge left `master` as a long mixed history with merge commits on top of features,
+rebuild the clean layer on a fresh upstream base (cherry-pick is version-independent):
 
 ```sh
 git stash
-git checkout -b zk <commit-before-the-first-feature>
-git cherry-pick -m 1 <task-queue> <build-fix> <router>   # rebuild the clean layer
-git rebase --no-merges upstream/master zk
+git checkout -b zk upstream/master
+git cherry-pick <task-queue> <build-fix> <router>   # rebuild the clean layer
 ```
-then push `zk -> origin/master` and rebuild from `zk`.
+then push `zk -> origin/master --force-with-lease` and rebuild from `zk`.
