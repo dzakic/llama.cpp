@@ -2171,6 +2171,9 @@ void server_persistent_checkpoint_cache::load_all() {
         index.emplace(hash, it);
     }
 
+    // Evict entries if the total size exceeds the limit after loading
+    evict_lru(0);
+
     SRV_INF("persistent checkpoint cache: %zu entries, %.3f MiB in '%s'\n",
             entries.size(), current_size_bytes / (1024.0 * 1024.0), dir.c_str());
 }
@@ -2234,10 +2237,11 @@ void server_persistent_checkpoint_cache::store(const server_tokens & tokens,
 
     // check if entry already exists
     auto mit = index.find(hash);
+    size_t old_disk_size = 0;
     if (mit != index.end()) {
-        // replace existing entry
+        // replace existing entry - save the old size for later
         auto & old_ent = *mit->second;
-        current_size_bytes -= old_ent.disk_size;
+        old_disk_size = old_ent.disk_size;
         std::error_code ec;
         std::filesystem::remove(old_ent.path, ec);
         entries.erase(mit->second);
@@ -2253,8 +2257,9 @@ void server_persistent_checkpoint_cache::store(const server_tokens & tokens,
 
     size_t disk_size = (size_t)std::filesystem::file_size(path);
 
-    // evict LRU if needed
-    evict_lru(disk_size);
+    // evict LRU if needed (account for the new entry's size minus any replaced entry)
+    size_t needed_bytes = disk_size - old_disk_size;
+    evict_lru(needed_bytes > 0 ? needed_bytes : 0);
 
     // add to index (back = newest)
     server_persistent_checkpoint_entry ent;
@@ -2268,6 +2273,9 @@ void server_persistent_checkpoint_cache::store(const server_tokens & tokens,
     auto it = entries.insert(entries.end(), std::move(ent));
     index.emplace(hash, it);
     current_size_bytes += disk_size;
+    if (old_disk_size > 0) {
+        current_size_bytes -= old_disk_size;
+    }
 
     SRV_INF("persistent checkpoint cache: stored entry hash=%s, tokens=%" PRId64 ", size=%.3f MiB\n",
             hash.c_str(), ent.n_tokens, disk_size / (1024.0 * 1024.0));

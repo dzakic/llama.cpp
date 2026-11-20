@@ -9,10 +9,18 @@ void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_Q1_0);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_is_contiguous(src0));
     GGML_ASSERT(ggml_is_contiguous(dst));
 
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    // The GEMM reads each (i2,i3) plane as column-major ne00 x ne01. src0 can be
+    // non-contiguous across planes (nb02/nb03), so lda is the src0 column stride
+    // (nb01/4) for F32, or ne00 for the dequantized Q1_0 buffer.
+    int64_t src0_lda = ne00;
+    if (src0->type == GGML_TYPE_F32) {
+        GGML_ASSERT(nb00 == sizeof(float));
+        src0_lda = nb01 / sizeof(float);
+    }
 
     // Get SYCL queue
     dpct::queue_ptr stream = ctx.stream();
@@ -72,7 +80,7 @@ void ggml_sycl_op_out_prod(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
 
                 // Perform matrix multiplication using oneMKL GEMM
                 oneapi::mkl::blas::column_major::gemm(*stream, oneapi::mkl::transpose::nontrans, src1_op,
-                                                      ne0, ne1, ne01, alpha, src0_plane, ne00,
+                                                      ne0, ne1, ne01, alpha, src0_plane, src0_lda,
                                                       src1_plane, ldb, beta, dst_plane, ne0);
             }
         }
