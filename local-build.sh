@@ -13,12 +13,12 @@
 #    * nvcc (CUDA 13.1) only accepts gcc up to 15, so C/CUDA host must be gcc-15.
 #    * The SYCL backend needs icpx as the CXX compiler (it creates the
 #      MKL::MKL_SYCL::BLAS import targets; g++/gcc cannot).
-#    * icpx is clang-based; its default warning flags (-Wunreachable-code-break,
+#    * icpx is clang-based; its warning flags (-Wunreachable-code-break,
 #      -Wunreachable-code-return, -Rno-debug-disables-optimization) are clang-only
-#      and break the gcc-15 C compile. Fixed upstream-side in ggml/cmake/common.cmake:
-#      ggml_get_flags() now reads C_FLAGS from CMAKE_C_COMPILER_ID and CXX_FLAGS
-#      from the passed CXX id, so gcc gets only -Wdouble-promotion while icpx
-#      keeps its IntelLLVM flags. Do not use icpx as the C compiler (nvcc rejects it).
+#      and break the gcc-15 C compile. Upstream ggml_get_flags() keys both C and
+#      CXX flags off the CXX compiler id; a local commit patches it so C_FLAGS
+#      follow CMAKE_C_COMPILER_ID while CXX_FLAGS follow the CXX id. Do not use
+#      icpx as the C compiler (nvcc rejects it).
 #
 #  Update flow (this repo is managed with jj on top of git, do NOT use
 #  git fetch/merge/stash here - jj owns the working tree):

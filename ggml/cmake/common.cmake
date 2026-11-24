@@ -3,28 +3,39 @@ function(ggml_get_flags CCID CCVER)
     set(CXX_FLAGS "")
 
     if (CCID MATCHES "Clang" OR CCID MATCHES "IntelLLVM")
-        set(C_FLAGS   -Wunreachable-code-break -Wunreachable-code-return)
         set(CXX_FLAGS -Wunreachable-code-break -Wunreachable-code-return -Wmissing-prototypes -Wextra-semi)
 
         if (CCID STREQUAL "IntelLLVM")
             # for Intel DPC++ and LLVM SYCL, using debug does not disable optimization
-            list(APPEND C_FLAGS    -Rno-debug-disables-optimization)
-            list(APPEND CXX_FLAGS  -Rno-debug-disables-optimization)
-        endif()
-
-        if (
-            (CCID STREQUAL "Clang"      AND CCVER VERSION_GREATER_EQUAL 3.8.0) OR
-            (CCID STREQUAL "AppleClang" AND CCVER VERSION_GREATER_EQUAL 7.3.0)
-        )
-            list(APPEND C_FLAGS -Wdouble-promotion)
+            list(APPEND CXX_FLAGS -Rno-debug-disables-optimization)
         endif()
     elseif (CCID STREQUAL "GNU")
-        set(C_FLAGS   -Wdouble-promotion)
         set(CXX_FLAGS -Wno-array-bounds)
 
         if (CCVER VERSION_GREATER_EQUAL 8.1.0)
             list(APPEND CXX_FLAGS -Wextra-semi)
         endif()
+    endif()
+
+    # C flags follow the C compiler, it may differ from the CXX one (gcc + icpx)
+    set(CID  ${CMAKE_C_COMPILER_ID})
+    set(CVER ${CMAKE_C_COMPILER_VERSION})
+
+    if (CID MATCHES "Clang" OR CID MATCHES "IntelLLVM")
+        set(C_FLAGS -Wunreachable-code-break -Wunreachable-code-return)
+
+        if (CID STREQUAL "IntelLLVM")
+            list(APPEND C_FLAGS -Rno-debug-disables-optimization)
+        endif()
+
+        if (
+            (CID STREQUAL "Clang"      AND CVER VERSION_GREATER_EQUAL 3.8.0) OR
+            (CID STREQUAL "AppleClang" AND CVER VERSION_GREATER_EQUAL 7.3.0)
+        )
+            list(APPEND C_FLAGS -Wdouble-promotion)
+        endif()
+    elseif (CID STREQUAL "GNU")
+        set(C_FLAGS -Wdouble-promotion)
     endif()
 
     set(GF_C_FLAGS   ${C_FLAGS}   PARENT_SCOPE)
