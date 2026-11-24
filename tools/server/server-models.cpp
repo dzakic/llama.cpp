@@ -406,6 +406,62 @@ void server_model_meta::update_caps(const common_params & base) {
     architecture = server_model_architecture_json(inp_image, inp_audio, false, output_modalities);
 }
 
+// how well a group member can serve the group: a loaded one is the best, one that
+// is coming up comes next, an unloaded one only if there is nothing else
+static int server_model_group_rank(const server_model_meta & meta) {
+    switch (meta.status) {
+        case SERVER_MODEL_STATUS_LOADED:              return 2;
+        case SERVER_MODEL_STATUS_LOADING:
+        case SERVER_MODEL_STATUS_SLEEPING:             return 1;
+        default:                                      return 0;
+    }
+}
+
+std::string server_model_resolve_name(const std::string & name, const std::vector<const server_model_meta *> & models) {
+    for (const auto * meta : models) {
+        if (meta->name == name) {
+            return name; // a canonical name resolves to itself
+        }
+    }
+
+    // the name is a group: it is shared by several models, pick the one that serves it
+    const server_model_meta * best = nullptr;
+    for (const auto * meta : models) {
+        if (meta->group != name) {
+            continue;
+        }
+        if (best == nullptr) {
+            best = meta;
+            continue;
+        }
+        const int rank = server_model_group_rank(*meta);
+        const int best_rank = server_model_group_rank(*best);
+        if (rank != best_rank) {
+            if (rank > best_rank) {
+                best = meta;
+            }
+            continue;
+        }
+        // among the members that serve the group equally well, the one that was
+        // used last serves it: the group does not switch away from a model that
+        // is already in use
+        if (meta->last_used > best->last_used) {
+            best = meta;
+        }
+    }
+    if (best != nullptr) {
+        return best->name;
+    }
+
+    // the name is an alias: it belongs to exactly one model
+    for (const auto * meta : models) {
+        if (meta->aliases.count(name)) {
+            return meta->name;
+        }
+    }
+    return "";
+}
+
 //
 // server_models
 //
@@ -451,10 +507,14 @@ void server_models::add_model(server_model_meta && meta) {
         throw std::runtime_error(string_format("model '%s' appears multiple times", meta.name.c_str()));
     }
 
-    // check model name does not conflict with existing aliases
+    // check model name does not conflict with existing aliases or groups
     for (const auto & [key, inst] : mapping) {
         if (inst.meta.aliases.count(meta.name)) {
             throw std::runtime_error(string_format("model name '%s' conflicts with alias of model '%s'",
+                meta.name.c_str(), key.c_str()));
+        }
+        if (!inst.meta.group.empty() && inst.meta.group == meta.name) {
+            throw std::runtime_error(string_format("model name '%s' conflicts with group of model '%s'",
                 meta.name.c_str(), key.c_str()));
         }
     }
@@ -470,6 +530,12 @@ void server_models::add_model(server_model_meta && meta) {
         }
     }
 
+    // parse the group from the preset's model-group option
+    std::string group;
+    if (meta.preset.get_option(COMMON_ARG_PRESET_MODEL_GROUP, group)) {
+        meta.group = string_strip(group);
+    }
+
     // parse tags from preset's --tags option (comma-separated)
     std::string tags_str;
     if (meta.preset.get_option("LLAMA_ARG_TAGS", tags_str) && !tags_str.empty()) {
@@ -481,7 +547,7 @@ void server_models::add_model(server_model_meta && meta) {
         }
     }
 
-    // validate aliases do not conflict with existing names or aliases
+    // an alias belongs to exactly one model, a name it shares with another model would be ambiguous
     for (const auto & alias : meta.aliases) {
         if (mapping.find(alias) != mapping.end()) {
             throw std::runtime_error(string_format("alias '%s' for model '%s' conflicts with existing model name",
@@ -491,6 +557,25 @@ void server_models::add_model(server_model_meta && meta) {
             if (inst.meta.aliases.count(alias)) {
                 throw std::runtime_error(string_format("alias '%s' for model '%s' conflicts with alias of model '%s'",
                     alias.c_str(), meta.name.c_str(), key.c_str()));
+            }
+            if (!inst.meta.group.empty() && inst.meta.group == alias) {
+                throw std::runtime_error(string_format("alias '%s' for model '%s' conflicts with group of model '%s'",
+                    alias.c_str(), meta.name.c_str(), key.c_str()));
+            }
+        }
+    }
+
+    // a group is shared by the models that declare it, but its name must not be
+    // a model name or an alias, a request for it would be ambiguous
+    if (!meta.group.empty()) {
+        if (mapping.find(meta.group) != mapping.end()) {
+            throw std::runtime_error(string_format("group '%s' for model '%s' conflicts with existing model name",
+                meta.group.c_str(), meta.name.c_str()));
+        }
+        for (const auto & [key, inst] : mapping) {
+            if (inst.meta.aliases.count(meta.group)) {
+                throw std::runtime_error(string_format("group '%s' for model '%s' conflicts with alias of model '%s'",
+                    meta.group.c_str(), meta.name.c_str(), key.c_str()));
             }
         }
     }
@@ -502,6 +587,15 @@ void server_models::add_model(server_model_meta && meta) {
         /* subproc */ std::make_shared<server_subproc>(),
         /* meta    */ std::move(meta)
     };
+}
+
+std::string server_models::resolve_name(const std::string & name) const {
+    std::vector<const server_model_meta *> models;
+    models.reserve(mapping.size());
+    for (const auto & [key, inst] : mapping) {
+        models.push_back(&inst.meta);
+    }
+    return server_model_resolve_name(name, models);
 }
 
 static bool has_sidecar(const std::vector<std::string> & sidecars, const std::string & kind) {
@@ -2247,6 +2341,7 @@ void server_models_routes::init_routes() {
             json model_info = json {
                 {"id",            meta.name},
                 {"aliases",       meta.aliases},
+                {"group",         meta.group},
                 {"tags",          meta.tags},
                 {"object",        "model"},    // for OAI-compat
                 {"owned_by",      "llamacpp"}, // for OAI-compat
@@ -2331,6 +2426,52 @@ void server_models_routes::init_routes() {
                 {"can_remove",   true},
                 {"sidecars",     d.sidecars},
             });
+        }
+
+        // the groups, listed as models of their own: the group name is a name a
+        // request can use, so a client that discovers the models from this list
+        // can pick the group and let the router pick the member
+        {
+            std::map<std::string, std::vector<std::string>> groups;
+            for (const auto & meta : all_models) {
+                if (meta.hidden || meta.group.empty()) {
+                    continue;
+                }
+                groups[meta.group].push_back(meta.name);
+            }
+            if (!groups.empty()) {
+                std::vector<const server_model_meta *> metas;
+                metas.reserve(all_models.size());
+                for (const auto & meta : all_models) {
+                    metas.push_back(&meta);
+                }
+
+                for (const auto & [group, members] : groups) {
+                    // the group is served by one of its members, it reports the
+                    // status of that one
+                    const std::string serving = server_model_resolve_name(group, metas);
+                    std::string status_value = "unloaded";
+                    for (const auto * meta : metas) {
+                        if (meta->name == serving) {
+                            status_value = server_model_status_to_string(meta->status);
+                            break;
+                        }
+                    }
+                    models_json.push_back(json {
+                        {"id",       group},
+                        {"aliases",  json::array()},
+                        {"group",    json::array()},
+                        {"members",  members},
+                        {"object",   "model"},
+                        {"owned_by", "llamacpp"},
+                        {"created",  t},
+                        {"status",   json {
+                            {"value", status_value},
+                            {"args",  json::array()},
+                        }},
+                    });
+                }
+            }
         }
 
         res_ok(res, {
