@@ -20,6 +20,14 @@
 #      from the passed CXX id, so gcc gets only -Wdouble-promotion while icpx
 #      keeps its IntelLLVM flags. Do not use icpx as the C compiler (nvcc rejects it).
 #
+#  Update flow (this repo is managed with jj on top of git, do NOT use
+#  git fetch/merge/stash here - jj owns the working tree):
+#    1. uncommitted local edits are saved as a commit
+#    2. jj git fetch --remote upstream   (downloads new upstream commits)
+#    3. jj rebase local commits onto master@upstream (jj does the merge)
+#    4. on conflicts: edit the files (or: jj resolve), then jj squash,
+#       then re-run this script
+#
 #  Usage:  ./local-build.sh
 # =============================================================================
 set -euo pipefail
@@ -46,14 +54,31 @@ echo "  Compilers: icpx (CXX), gcc-15 (C/CUDA host)"
 echo "============================================================"
 
 # -----------------------------------------------------------------------------
-echo "==> [1/4] Update source (fetch upstream + merge into local branch, preserving local edits)"
+echo "==> [1/4] Update source (jj: commit local edits, fetch upstream, rebase local onto master@upstream)"
 cd "$SRC"
-git stash push -u -m "auto-stash-before-update" >/dev/null 2>&1 || true
-git fetch upstream >/dev/null 2>&1
-BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-git merge -m "chase upstream features" "upstream/$BRANCH"
-git stash pop >/dev/null 2>&1 || echo "    ! Local edits conflicted with the update — resolve manually."
-echo "    HEAD: $(git log -1 --pretty='%h %s')"
+
+# save uncommitted local edits as a commit so the rebase operates on commits
+if ! jj status | grep -q '^The working copy has no changes'; then
+    jj describe -m "local: wip $(date +%Y-%m-%d_%H%M)"
+    jj new
+fi
+
+# jj shares the git remotes: origin = personal fork, upstream = ggml-org/llama.cpp
+jj git fetch --remote upstream
+
+# move local commits (those not on any remote, including the empty working-copy
+# commit @ so it follows the stack) onto the new upstream tip; jj does the merge
+if [ -n "$(jj log -r 'remote_bookmarks()..@' -T 'commit_id.short() ++ "\n"')" ]; then
+    jj rebase -r 'remote_bookmarks()..@' -d 'master@upstream' || echo "    ! rebase reported conflicts"
+
+    if [ -n "$(jj log -r '(remote_bookmarks()..@) & conflicts()' -T 'commit_id.short() ++ "\n"')" ]; then
+        echo "    ! CONFLICTS after rebase. Resolve, then re-run this script:"
+        echo "        jj resolve     # conflict editor (or edit the files directly)"
+        echo "        jj squash      # fold the resolution into the commit below @"
+        exit 1
+    fi
+fi
+echo "    HEAD: $(jj log -r '@-' -T 'commit_id.short() ++ " " ++ description.first_line()' | sed 's/^[^ ]* *//')"
 
 # -----------------------------------------------------------------------------
 echo "==> [2/4] Configure & build (DNNL needs -DTBB_DIR to bypass its FindTBB bug)"
