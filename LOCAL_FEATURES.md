@@ -54,7 +54,13 @@ A request for `"model": "flash"` is routed to the loaded member of the group. A 
    jj commit -m "server: implement model-group feature"
    ```
 
-2. **Fetch and Rebase:**
+2. **Push to Remote (Optional, for backup):**
+   ```bash
+   # Push current working copy to a new branch
+   git push origin HEAD:refs/heads/local-model-group
+   ```
+
+3. **Fetch and Rebase:**
    ```bash
    # Fetch upstream changes
    jj fetch git+https://github.com/ggml-org/llama.cpp --bookmark master@upstream
@@ -63,12 +69,12 @@ A request for `"model": "flash"` is routed to the loaded member of the group. A 
    jj rebase -r @ -d master@upstream
    ```
 
-3. **Build and Test:**
+4. **Build and Test:**
    ```bash
    bash local-build.sh
    ```
 
-4. **Verify Features:**
+5. **Verify Features:**
    - Check that `--model-group` works with preset files
    - Test that `/models` endpoint shows group information
    - Run the test suite: `test-server-component`
