@@ -56,7 +56,7 @@ A request for `"model": "flash"` is routed to the loaded member of the group. A 
 
 2. **Fetch and Rebase:**
    ```bash
-   # Fetch upstream
+   # Fetch upstream changes
    jj fetch git+https://github.com/ggml-org/llama.cpp --bookmark master@upstream
    
    # Rebase local changes onto upstream master
